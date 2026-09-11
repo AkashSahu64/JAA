@@ -1,0 +1,15 @@
+{
+  "name": "@jobagent/ai",
+  "version": "1.0.0",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "openai": "^4.52.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.5.0"
+  }
+}

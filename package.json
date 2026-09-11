@@ -1,0 +1,35 @@
+{
+  "name": "job-application-agent",
+  "private": true,
+  "workspaces": ["apps/*", "packages/*"],
+  "scripts": {
+    "dev": "concurrently \"npm run dev:api\" \"npm run dev:web\"",
+    "dev:api": "npm run dev -w apps/api",
+    "dev:web": "npm run dev -w apps/web",
+    "build": "npm run build --workspaces --if-present",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "lint": "eslint \"apps/**/*.{ts,tsx}\" \"packages/**/*.{ts,tsx}\" --ignore-pattern \"**/dist/**\" --ignore-pattern \"**/*.d.ts\" --ignore-pattern \"**/*.js\"",
+    "test": "vitest run",
+    "test:database": "node scripts/run-database-integration.mjs",
+    "test:queue": "node scripts/run-queue-integration.mjs",
+    "test:redis-outage": "node scripts/run-redis-outage-integration.mjs",
+    "db:generate": "prisma generate --schema packages/database/prisma/schema.prisma",
+    "db:push": "prisma db push --schema packages/database/prisma/schema.prisma",
+    "db:migrate": "prisma migrate dev --schema packages/database/prisma/schema.prisma",
+    "db:migrate:deploy": "prisma migrate deploy --schema packages/database/prisma/schema.prisma",
+    "db:migrate:status": "prisma migrate status --schema packages/database/prisma/schema.prisma",
+    "db:migrate:verify": "prisma validate --schema packages/database/prisma/schema.prisma && prisma migrate status --schema packages/database/prisma/schema.prisma",
+    "db:seed": "npm run seed -w @jobagent/database",
+    "db:studio": "prisma studio --schema packages/database/prisma/schema.prisma",
+    "check": "npm run db:generate && npm run typecheck && npm run lint && npm test && npm run build"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "@typescript-eslint/eslint-plugin": "8.42.0",
+    "@typescript-eslint/parser": "8.42.0",
+    "typescript": "^5.5.0",
+    "concurrently": "^8.2.0",
+    "eslint": "^8.56.0",
+    "vitest": "4.1.11"
+  }
+}
