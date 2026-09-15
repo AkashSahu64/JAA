@@ -12,6 +12,7 @@ import {
 } from '@jobagent/job-engine';
 import { executeIdempotentCommand } from './idempotency';
 import { cancelAutomationJob } from './automation-jobs';
+import { safeErrorMessage } from '../observability/structured-log';
 
 export type DiscoverySourceName = 'GREENHOUSE' | 'LEVER' | 'ASHBY';
 export type DiscoveryRunState = 'PENDING' | 'RUNNING' | 'SUCCEEDED' | 'PARTIAL' | 'FAILED' | 'CANCELLED';
@@ -288,7 +289,7 @@ export async function executeDiscoveryRun(
     const completedAt = new Date();
     await withTenant(userId, async tx => {
       await assertExecutionAuthority(tx, userId, runId, authority, completedAt);
-      await tx.jobDiscoveryRun.update({
+      const completedRun = await tx.jobDiscoveryRun.update({
         where: { id: runId },
         data: {
           status, completedAt, heartbeatAt: completedAt,
@@ -303,6 +304,16 @@ export async function executeDiscoveryRun(
           }),
         },
       });
+      if (completedRun.jobsCreated > 0 || completedRun.jobsUpdated > 0) {
+        await tx.outboxEvent.upsert({
+          where: { idempotencyKey: `discovery-completed:${runId}` },
+          create: {
+            userId, aggregateType: 'JobDiscoveryRun', aggregateId: runId, eventType: 'job.discovery.completed',
+            payload: { status, jobsCreated: completedRun.jobsCreated, jobsUpdated: completedRun.jobsUpdated, itemsDuplicate: completedRun.itemsDuplicate },
+            schemaVersion: 1, correlationId: runId, idempotencyKey: `discovery-completed:${runId}`,
+          }, update: {},
+        });
+      }
     });
     run = await loadDiscoveryRun(userId, runId);
   } catch (error) {
@@ -525,7 +536,7 @@ async function recordNormalizationRejection(
       sourceCursor: run.nextCursor ?? run.cursor, pageNumber, position: rejection.providerIndex,
       fetchedAt: new Date(), rawPayload, rawContentHash: hash, status: 'REJECTED',
       errorClass: 'NORMALIZATION', errorCode: 'DISCOVERY_INVALID_RESPONSE',
-      errorMessage: rejection.error.message.slice(0, 1_000), errorRetryable: false, processedAt: new Date(),
+      errorMessage: safeErrorMessage(rejection.error, 1_000), errorRetryable: false, processedAt: new Date(),
     } });
   });
 }
@@ -760,11 +771,10 @@ export function classifyDiscoveryFailure(error: unknown, fallback: DiscoveryErro
   return {
     errorClass,
     errorCode,
-    errorMessage: error instanceof Error ? error.message.slice(0, 1000) : 'Unknown discovery failure',
+    errorMessage: safeErrorMessage(error, 1_000),
     errorRetryable: retryable,
     errorRetryAfterMs: validRetryAfterMs(
       error && typeof error === 'object' ? (error as { retryAfterMs?: unknown }).retryAfterMs : undefined,
     ),
   };
 }
-

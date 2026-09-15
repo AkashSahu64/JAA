@@ -39,23 +39,43 @@ describe('authenticated encryption', () => {
 });
 
 describe('CredentialVault', () => {
+  it('is disabled in production so process-local secrets cannot be used accidentally', () => {
+    const previous = process.env.NODE_ENV;
+    process.env.NODE_ENV = 'production';
+    try {
+      expect(() => new CredentialVault()).toThrow('disabled in production');
+    } finally {
+      if (previous === undefined) delete process.env.NODE_ENV;
+      else process.env.NODE_ENV = previous;
+    }
+  });
+
   it('stores, lists, updates, retrieves, and deletes encrypted values', async () => {
     const vault = new CredentialVault();
-    const id = await vault.store('  API key  ', 'initial-secret');
+    const id = await vault.store('tenant-a', '  API key  ', 'initial-secret');
 
-    expect(await vault.retrieve(id)).toBe('initial-secret');
-    expect(await vault.list()).toContainEqual(expect.objectContaining({ id, name: 'API key' }));
-    await expect(vault.update(id, 'replacement-secret')).resolves.toBe(true);
-    expect(await vault.retrieve(id)).toBe('replacement-secret');
-    await expect(vault.delete(id)).resolves.toBe(true);
-    await expect(vault.retrieve(id)).resolves.toBeNull();
+    expect(await vault.retrieve('tenant-a', id)).toBe('initial-secret');
+    expect(await vault.list('tenant-a')).toContainEqual(expect.objectContaining({ id, name: 'API key' }));
+    await expect(vault.update('tenant-a', id, 'replacement-secret')).resolves.toBe(true);
+    expect(await vault.retrieve('tenant-a', id)).toBe('replacement-secret');
+    await expect(vault.delete('tenant-a', id)).resolves.toBe(true);
+    await expect(vault.retrieve('tenant-a', id)).resolves.toBeNull();
   });
 
   it('validates names and values and reports missing records', async () => {
     const vault = new CredentialVault();
-    await expect(vault.store('   ', 'secret')).rejects.toThrow('Credential name');
-    await expect(vault.store('name', '')).rejects.toThrow('Credential value');
-    await expect(vault.update('missing', 'value')).resolves.toBe(false);
+    await expect(vault.store('tenant-a', '   ', 'secret')).rejects.toThrow('Credential name');
+    await expect(vault.store('tenant-a', 'name', '')).rejects.toThrow('Credential value');
+    await expect(vault.update('tenant-a', 'missing', 'value')).resolves.toBe(false);
+  });
+
+  it('isolates credentials by owner', async () => {
+    const vault = new CredentialVault();
+    const id = await vault.store('tenant-a', 'api', 'secret');
+    await expect(vault.retrieve('tenant-b', id)).resolves.toBeNull();
+    await expect(vault.update('tenant-b', id, 'stolen')).resolves.toBe(false);
+    await expect(vault.delete('tenant-b', id)).resolves.toBe(false);
+    expect(await vault.list('tenant-b')).toHaveLength(0);
   });
 });
 

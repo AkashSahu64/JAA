@@ -1,4 +1,6 @@
 import { Request, Response, NextFunction } from 'express';
+import { writeStructuredLog } from '../observability/structured-log';
+import { normalizeCorrelationId } from './request-logger';
 
 export class AppError extends Error {
   constructor(
@@ -17,7 +19,13 @@ export function errorHandler(
   res: Response,
   _next: NextFunction
 ): void {
-  console.error('Error:', err.message);
+  writeStructuredLog('error', {
+    event: 'http.error',
+    correlationId: normalizeCorrelationId(_req.header('x-correlation-id')),
+    userId: (_req as Request & { user?: { userId?: string } }).user?.userId,
+    errorName: err.name,
+    errorMessage: err.message,
+  });
   
   if (err instanceof AppError) {
     res.status(err.statusCode).json({

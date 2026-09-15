@@ -13,7 +13,7 @@ import { FailedAppsView } from './views/FailedAppsView';
 import { AnalyticsView } from './views/AnalyticsView';
 import { SettingsView } from './views/SettingsView';
 import { AuthUser, NavView } from './types';
-import { AuthSession, clearSession, fetchAutomationStatus, restoreSession, setAutomationState } from './services/api';
+import { AuthSession, clearSession, fetchAutomationStatus, logout, restoreSession, setAutomationState } from './services/api';
 
 export function App() {
   const [currentView, setCurrentView] = useState<NavView>('dashboard');
@@ -43,6 +43,7 @@ export function App() {
 
   const onAuthenticated = (session: AuthSession) => setUser(session.user);
   const signOut = () => {
+    void logout();
     clearSession();
     setUser(null);
     setAutomationRunning(false);
@@ -97,7 +98,7 @@ export function App() {
     <div className="flex min-h-screen bg-slate-950 text-slate-100 font-sans">
       <Sidebar currentView={currentView} onSelectView={setCurrentView} automationRunning={automationRunning} automationBusy={automationBusy} onToggleAutomation={toggleAutomation} />
       <div className="flex-1 flex flex-col min-w-0">
-        <Header user={user} onSignOut={signOut} onOpenCmdK={() => setIsCmdKOpen(true)} onOpenAIChat={() => setIsAIChatOpen(true)} />
+        <Header user={user} onSignOut={signOut} onOpenCmdK={() => setIsCmdKOpen(true)} onOpenAIChat={() => setIsAIChatOpen(true)} onOpenHumanReview={() => setCurrentView('failed-apps')} />
         <main className="flex-1 p-6 md:p-8 overflow-y-auto">{renderView()}</main>
       </div>
       <CmdKModal isOpen={isCmdKOpen} onClose={() => setIsCmdKOpen(false)} onSelectView={setCurrentView} onStartAutomation={() => { if (!automationRunning) void toggleAutomation(); }} />

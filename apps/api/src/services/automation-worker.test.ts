@@ -9,16 +9,12 @@ const mocks = vi.hoisted(() => ({
   validateAutomationJobRetry: vi.fn(),
   findFirst: vi.fn(),
   findUnique: vi.fn(),
+  withService: vi.fn(),
   workerOptions: undefined as Record<string, unknown> | undefined,
 }));
 
 vi.mock('@jobagent/database', () => ({
-  prisma: {
-    automationJob: {
-      findFirst: mocks.findFirst,
-      findUnique: mocks.findUnique,
-    },
-  },
+  withService: mocks.withService,
 }));
 
 vi.mock('@jobagent/queue', () => ({
@@ -73,6 +69,7 @@ describe('automation worker retry authority', () => {
     vi.clearAllMocks();
     mocks.workerOptions = undefined;
     mocks.validateAutomationJobRetry.mockResolvedValue(undefined);
+    mocks.withService.mockImplementation(async (operation: (tx: unknown) => Promise<unknown>) => operation({ automationJob: { findFirst: mocks.findFirst, findUnique: mocks.findUnique } }));
   });
 
   it('completes a BullMQ retry using its current lease rather than the original dispatch attempt', async () => {
@@ -144,6 +141,31 @@ describe('automation worker retry authority', () => {
     });
   });
 
+  it('includes bounded application/provider trace context without logging job payloads', async () => {
+    const output = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+    const leased = {
+      id: message.automationJobId,
+      userId: 'user-1',
+      type: message.type,
+      payload: { applicationId: 'application-1', providerName: 'greenhouse', answer: 'secret' },
+      payloadVersion: message.payloadVersion,
+      correlationId: message.correlationId,
+      deliveryGeneration: message.deliveryGeneration,
+      attemptCount: 1,
+    };
+    mocks.leaseAutomationJob.mockResolvedValue(leased);
+    const handler = vi.fn().mockResolvedValue(undefined);
+    startAutomationWorker({ name: 'applications', workerId: 'worker-1', handler });
+    const processor = callback<(message: TestMessage, context: { workerId: string; signal: AbortSignal; heartbeat: () => Promise<void> }) => Promise<unknown>>('processor');
+
+    await processor(message, { workerId: 'worker-1', signal: new AbortController().signal, heartbeat: vi.fn().mockResolvedValue(undefined) });
+
+    const record = JSON.parse(output.mock.calls[0][0] as string) as Record<string, unknown>;
+    expect(record).toMatchObject({ applicationId: 'application-1', provider: 'greenhouse', automationJobId: message.automationJobId });
+    expect(JSON.stringify(record)).not.toContain('secret');
+    output.mockRestore();
+  });
+
   it('authorizes the exact retry transition before queue data is advanced', async () => {
     const events: string[] = [];
     mocks.validateAutomationJobRetry.mockImplementation(async () => { events.push('postgres'); });
@@ -185,6 +207,38 @@ describe('automation worker retry authority', () => {
     expect(mocks.failAutomationJob).toHaveBeenLastCalledWith(expect.objectContaining({
       error: 'ordinary', providerRetryAfterMs: undefined,
     }));
+  });
+
+  it('includes authoritative provider/application trace context on failure records', async () => {
+    const output = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    const leased = {
+      ...message,
+      id: message.automationJobId,
+      userId: 'user-1',
+      payload: { applicationId: 'application-1', provider: 'lever', answer: 'must not log' },
+      attemptCount: 1,
+    };
+    mocks.findFirst.mockResolvedValue(leased);
+    mocks.failAutomationJob.mockResolvedValue({ ...leased, status: JobStatus.AVAILABLE });
+    startAutomationWorker({ name: 'applications', workerId: 'worker-1', handler: vi.fn() });
+    const onFailure = callback<(message: TestMessage, error: Error, retryDelayMs: number) => Promise<string>>('onFailure');
+
+    await expect(onFailure(message, new Error('provider failure'), 1_000)).resolves.toBe('RETRY');
+    const record = JSON.parse(output.mock.calls[0][0] as string) as Record<string, unknown>;
+    expect(record).toMatchObject({ applicationId: 'application-1', provider: 'lever', automationJobId: message.automationJobId });
+    expect(JSON.stringify(record)).not.toContain('must not log');
+    output.mockRestore();
+  });
+
+  it('normalizes non-Error failures so retry/dead-letter handling is not masked', async () => {
+    const leased = { ...message, id: message.automationJobId, userId: 'user-1', payload: {}, attemptCount: 1 };
+    mocks.findFirst.mockResolvedValue(leased);
+    mocks.failAutomationJob.mockResolvedValue({ ...leased, status: JobStatus.AVAILABLE });
+    startAutomationWorker({ name: 'applications', workerId: 'worker-1', handler: vi.fn() });
+    const onFailure = callback<(message: TestMessage, error: Error, retryDelayMs: number) => Promise<string>>('onFailure');
+
+    await expect(onFailure(message, 'provider rejected' as never, 1_000)).resolves.toBe('RETRY');
+    expect(mocks.failAutomationJob).toHaveBeenLastCalledWith(expect.objectContaining({ error: 'Unknown automation failure' }));
   });
 
   it('classifies only conclusive lease-lost errors', () => {

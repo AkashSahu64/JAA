@@ -1,11 +1,15 @@
 import { isIP } from 'node:net';
+import { lookup } from 'node:dns/promises';
 
 export type BrowserNavigationDenialReason =
   | 'INVALID_URL'
   | 'HTTPS_REQUIRED'
+  | 'HTTPS_PORT_NOT_ALLOWED'
   | 'CREDENTIALS_NOT_ALLOWED'
   | 'HOST_NOT_ALLOWLISTED'
-  | 'BLOCKED_IP_LITERAL';
+  | 'BLOCKED_IP_LITERAL'
+  | 'DNS_RESOLUTION_FAILED'
+  | 'BLOCKED_RESOLVED_IP';
 
 export type BlockedIpCategory =
   | 'UNSPECIFIED'
@@ -27,6 +31,8 @@ export interface BrowserNavigationPolicyOptions {
   readonly allowedHosts: readonly string[];
   /** Exact matching remains the default. Prefer explicit `*.example.invalid` entries. */
   readonly allowSubdomains?: boolean;
+  /** Override DNS resolution in tests or with a resolver that enforces platform DNS policy. */
+  readonly resolveHostname?: (hostname: string) => Promise<readonly string[]>;
 }
 
 type AllowedHost = { hostname: string; wildcard: boolean };
@@ -147,10 +153,13 @@ export function classifyBlockedIpLiteral(hostname: string): BlockedIpCategory | 
 
 export class BrowserNavigationPolicy {
   private readonly allowedHosts: readonly AllowedHost[];
+  private readonly resolveHostname: (hostname: string) => Promise<readonly string[]>;
 
   constructor(options: BrowserNavigationPolicyOptions) {
     if (!options.allowedHosts.length) throw new TypeError('At least one allowed browser host is required');
     this.allowedHosts = options.allowedHosts.map(host => parseAllowedHost(host, options.allowSubdomains ?? false));
+    this.resolveHostname = options.resolveHostname ?? (async hostname =>
+      (await lookup(hostname, { all: true, verbatim: true })).map(address => address.address));
   }
 
   evaluate(target: string | URL): BrowserNavigationDecision {
@@ -162,6 +171,7 @@ export class BrowserNavigationPolicy {
     }
 
     if (url.protocol !== 'https:') return { allowed: false, reason: 'HTTPS_REQUIRED' };
+    if (url.port && url.port !== '443') return { allowed: false, reason: 'HTTPS_PORT_NOT_ALLOWED' };
     if (url.username || url.password) return { allowed: false, reason: 'CREDENTIALS_NOT_ALLOWED' };
 
     const hostname = normalizeBrowserHostname(url.hostname);
@@ -191,6 +201,44 @@ export class BrowserNavigationPolicy {
 
   assertRedirectAllowed(previousUrl: string | URL, redirectTarget: string | URL): URL {
     const decision = this.evaluateRedirect(previousUrl, redirectTarget);
+    if (!decision.allowed) throw new BrowserNavigationPolicyError(decision);
+    return new URL(decision.normalizedUrl!);
+  }
+
+  /**
+   * Resolve and validate a target before navigation. A hostname may be allowlisted
+   * while resolving to an internal address, so every returned address is checked and
+   * resolution failures are denied rather than treated as safe.
+   */
+  async evaluateResolved(target: string | URL): Promise<BrowserNavigationDecision> {
+    const decision = this.evaluate(target);
+    if (!decision.allowed || !decision.hostname) return decision;
+
+    let addresses: readonly string[];
+    try {
+      addresses = await this.resolveHostname(decision.hostname);
+    } catch {
+      return { allowed: false, hostname: decision.hostname, reason: 'DNS_RESOLUTION_FAILED' };
+    }
+    if (!addresses.length) {
+      return { allowed: false, hostname: decision.hostname, reason: 'DNS_RESOLUTION_FAILED' };
+    }
+    for (const address of addresses) {
+      const blockedIpCategory = classifyBlockedIpLiteral(address);
+      if (blockedIpCategory) {
+        return {
+          allowed: false,
+          hostname: decision.hostname,
+          reason: 'BLOCKED_RESOLVED_IP',
+          blockedIpCategory,
+        };
+      }
+    }
+    return decision;
+  }
+
+  async assertResolvedAllowed(target: string | URL): Promise<URL> {
+    const decision = await this.evaluateResolved(target);
     if (!decision.allowed) throw new BrowserNavigationPolicyError(decision);
     return new URL(decision.normalizedUrl!);
   }

@@ -2,6 +2,7 @@ import { Router, Response } from 'express';
 import { getAIProvider, AIMessage } from '@jobagent/ai';
 import { authenticate, AuthenticatedRequest } from '../middleware/auth';
 import { isRecord } from '../middleware/validate';
+import { logRouteError } from '../observability/structured-log';
 
 const router = Router();
 router.use(authenticate);
@@ -37,7 +38,7 @@ router.post('/chat', async (req: AuthenticatedRequest, res: Response) => {
     if (message.includes('AI_API_KEY') || message.includes('Unsupported AI provider')) {
       return res.status(503).json({ success: false, error: 'AI assistant is not configured' });
     }
-    console.error('AI chat error:', error);
+    logRouteError('ai.chat_failure', error, { correlationId: req.get('x-correlation-id'), userId: req.user?.userId });
     return res.status(502).json({ success: false, error: 'AI provider request failed' });
   }
 });

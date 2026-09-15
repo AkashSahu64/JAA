@@ -60,7 +60,7 @@ describe('job discovery service', () => {
     const heartbeat = vi.fn().mockResolvedValue(undefined);
     const handlers = createProductionAutomationJobHandlers({ executeDiscoveryRun: execute });
 
-    expect([...handlers.keys()]).toEqual(['ANALYZE_JOB', 'MATCH_JOB', 'TAILOR_RESUME', 'EVALUATE_ATS', 'EVALUATE_APPLICATION_QUALITY', 'COMPLETE_GREENHOUSE_APPLICATION', 'COMPLETE_LEVER_APPLICATION', 'RESUME_APPLICATION_AFTER_VERIFICATION', 'DISCOVER_JOBS']);
+    expect([...handlers.keys()]).toEqual(['ANALYZE_JOB', 'MATCH_JOB', 'TAILOR_RESUME', 'EVALUATE_ATS', 'EVALUATE_APPLICATION_QUALITY', 'COMPLETE_GREENHOUSE_APPLICATION', 'COMPLETE_LEVER_APPLICATION', 'EXECUTE_AUTHORIZED_SUBMISSION', 'EMAIL_OUTCOME', 'VERIFY_SUBMISSION_CONFIRMATION', 'RESUME_APPLICATION_AFTER_VERIFICATION', 'DISCOVER_JOBS']);
     await handlers.get('DISCOVER_JOBS')!({
       automationJobId: 'automation-1', userId: 'user-1', type: 'DISCOVER_JOBS',
       payload: { runId: 'run-1' }, payloadVersion: 1, correlationId: 'run-1',

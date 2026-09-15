@@ -45,6 +45,7 @@ describe('notification outbox consumer', () => {
   it.each([
     ['WAITING_FOR_USER', 'USER_APPROVAL_REQUIRED', 'Action required'],
     ['CONFIRMED', 'APPLICATION_SUBMITTED', 'Application confirmed'],
+    ['ASSESSMENT', 'ASSESSMENT_DETECTED', 'Assessment detected'],
     ['FAILED', 'APPLICATION_FAILED', 'Application needs attention'],
     ['INTERVIEW', 'INTERVIEW_DETECTED', 'Interview detected'],
     ['OFFER', 'OFFER_DETECTED', 'Offer detected'],
@@ -68,6 +69,75 @@ describe('notification outbox consumer', () => {
     });
   });
 
+  it('notifies for uncertain submissions and human verification requests', () => {
+    expect(mapOutboxEventToNotification(event({ payload: { fromStatus: 'SUBMISSION_PENDING', toStatus: 'UNCONFIRMED', version: 3 } })))
+      .toMatchObject({ type: 'SUBMISSION_UNCERTAIN' });
+    expect(mapOutboxEventToNotification(event({
+      aggregateType: 'SubmissionAuthorization', aggregateId: 'authorization-1', eventType: 'submission.outcome.unknown',
+      payload: { applicationId: 'application-1', authorizationId: 'authorization-1', independentlyConfirmed: false },
+    }))).toMatchObject({
+      type: 'SUBMISSION_UNCERTAIN',
+      message: expect.stringContaining('automatic retry is blocked'),
+      data: { applicationId: 'application-1', authorizationId: 'authorization-1' },
+    });
+    expect(mapOutboxEventToNotification(event({
+      aggregateType: 'HumanVerification', aggregateId: 'verification-1', eventType: 'human-verification.requested',
+      payload: { applicationId: 'application-1', verificationId: 'verification-1', type: 'CAPTCHA' },
+    }))).toMatchObject({ type: 'CAPTCHA_REQUIRED', data: { applicationId: 'application-1', verificationId: 'verification-1', verificationType: 'CAPTCHA' } });
+    expect(mapOutboxEventToNotification(event({
+      aggregateType: 'HumanVerification', aggregateId: 'legacy-verification-1', eventType: 'human-verification.requested',
+      payload: { applicationId: 'application-1', type: 'MFA' },
+    }))).toMatchObject({ type: 'MFA_REQUIRED', data: { verificationId: 'legacy-verification-1' } });
+    expect(mapOutboxEventToNotification(event({
+      aggregateType: 'HumanVerification', aggregateId: 'verification-1', eventType: 'human-verification.requested',
+      payload: { applicationId: 'application-1', verificationId: ' ', type: 'CAPTCHA' },
+    }))).toBeNull();
+  });
+
+  it('maps durable discovery completion events to job notifications', () => {
+    expect(mapOutboxEventToNotification(event({
+      aggregateType: 'JobDiscoveryRun', aggregateId: 'discovery-1', eventType: 'job.discovery.completed',
+      payload: { status: 'SUCCEEDED', jobsCreated: 3, jobsUpdated: 1, itemsDuplicate: 2 },
+    }))).toMatchObject({
+      type: 'JOB_DISCOVERED', title: 'Jobs discovered',
+      data: { discoveryRunId: 'discovery-1', jobsCreated: 3, jobsUpdated: 1 },
+    });
+    expect(mapOutboxEventToNotification(event({
+      aggregateType: 'JobDiscoveryRun', eventType: 'job.discovery.completed', payload: { jobsCreated: 0, jobsUpdated: 0 },
+    }))).toBeNull();
+  });
+
+  it('maps provider review-required events to a durable approval notification', () => {
+    expect(mapOutboxEventToNotification(event({
+      eventType: 'application.review-required',
+      payload: { provider: 'LEVER', step: 2, requiredBlockingFieldIds: ['question-1'], validationErrors: [{ fieldId: 'email', message: 'Invalid email' }] },
+    }))).toMatchObject({
+      type: 'USER_APPROVAL_REQUIRED', title: 'Application review required',
+      data: { applicationId: 'application-1', provider: 'LEVER', blockingFieldCount: 1, validationErrorCount: 1 },
+    });
+  });
+
+  it('maps scheduled application runs to durable tenant notifications', () => {
+    expect(mapOutboxEventToNotification(event({
+      eventType: 'application.run.scheduled',
+      payload: { applicationId: 'application-1', automationJobId: 'automation-1', provider: 'LEVER', runAt: '2026-09-16T10:00:00.000Z' },
+    }))).toMatchObject({
+      type: 'APPLICATION_SCHEDULED', title: 'Application run scheduled',
+      data: { applicationId: 'application-1', automationJobId: 'automation-1', provider: 'LEVER', runAt: '2026-09-16T10:00:00.000Z' },
+    });
+    expect(mapOutboxEventToNotification(event({ eventType: 'application.run.scheduled', payload: { applicationId: 'application-1' } }))).toBeNull();
+  });
+
+  it('maps classified email outcomes to a durable review notification without changing lifecycle state', () => {
+    expect(mapOutboxEventToNotification(event({
+      aggregateType: 'EmailOutcome', aggregateId: 'email-outcome-1', eventType: 'email.outcome.detected',
+      payload: { applicationId: 'application-1', classification: 'INTERVIEW_INVITATION', confidence: 'HIGH' },
+    }))).toMatchObject({
+      type: 'EMAIL_OUTCOME_DETECTED',
+      data: { emailOutcomeId: 'email-outcome-1', applicationId: 'application-1', classification: 'INTERVIEW_INVITATION', confidence: 'HIGH' },
+    });
+  });
+
   it('derives stable identity from tenant and event identity', () => {
     const first = mapOutboxEventToNotification(event());
     const duplicateDelivery = mapOutboxEventToNotification(event({ id: 'delivery-copy' }));
@@ -82,8 +152,18 @@ describe('notification outbox consumer', () => {
     { schemaVersion: 2 },
     { userId: null },
     { payload: { toStatus: 'CONFIRMED', version: 1 } },
-    { payload: { fromStatus: 'QUEUED', toStatus: 'READY_TO_SUBMIT', version: 2 } },
+    { payload: { fromStatus: 'QUEUED', toStatus: 'APPLICATION_STARTED', version: 2 } },
   ])('safely ignores unsupported or malformed events %#', (override) => {
+    expect(mapOutboxEventToNotification(event(override))).toBeNull();
+  });
+
+  it.each([
+    { aggregateId: 42 as never },
+    { correlationId: '' },
+    { idempotencyKey: 'x'.repeat(301) },
+    { occurredAt: 'not-a-date' as never },
+    { userId: 42 as never },
+  ])('rejects malformed notification envelope identity %#', override => {
     expect(mapOutboxEventToNotification(event(override))).toBeNull();
   });
 

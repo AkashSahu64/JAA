@@ -1,18 +1,19 @@
 import { Router, Response } from 'express';
 import multer from 'multer';
 import path from 'path';
-import { prisma, withTenant } from '@jobagent/database';
+import { withTenant } from '@jobagent/database';
 import { authenticate, AuthenticatedRequest } from '../middleware/auth';
 import { sanitizeFileName } from '@jobagent/security';
 import { ResumeParser } from '@jobagent/resume-engine';
 import { createAutomationJob } from '../services/automation-jobs';
-import { DocumentStorage, DocumentStorageError } from '../services/document-storage';
+import { DocumentStorage, DocumentStorageError, persistDocumentMetadataInTransaction } from '../services/document-storage';
 import {
   CandidateFactError,
   decideResumeCandidateFact,
   listResumeCandidateFacts,
   replaceResumeCandidateFacts,
 } from '../services/candidate-facts';
+import { logRouteError } from '../observability/structured-log';
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -57,8 +58,9 @@ router.post('/upload', upload.single('resume'), async (req: AuthenticatedRequest
       mimeType: uploadedFile.mimetype,
       buffer: uploadedFile.buffer,
     });
-    let persisted = false;
-    try {
+    // A failed metadata transaction must not delete this content-addressed
+    // object: another upload may already reference it.
+    {
       const parsed = await parser.parseBuffer(uploadedFile.buffer, fileName);
       const resume = await withTenant(req.user!.userId, async (tx) => {
         if (req.body.isMaster === 'true' || req.body.isMaster === true) {
@@ -78,27 +80,14 @@ router.post('/upload', upload.single('resume'), async (req: AuthenticatedRequest
             })),
           },
         });
-        await tx.objectMetadata.create({
-          data: {
-            userId: req.user!.userId,
-            resumeId: created.id,
-            bucket: stored.bucket,
-            objectKey: stored.objectKey,
-            versionId: stored.versionId,
-            kind: 'RESUME_SOURCE',
-            fileName: stored.fileName,
-            mimeType: stored.mimeType,
-            byteSize: BigInt(stored.byteSize),
-            checksumSha256: stored.checksumSha256,
-            encryptionKeyRef: stored.encryptionKeyRef,
-            scanStatus: stored.scanStatus,
-            scanDetails: stored.scanDetails,
-            provenance: { source: 'RESUME_UPLOAD' },
-          },
+        await persistDocumentMetadataInTransaction(tx, {
+          userId: req.user!.userId,
+          stored,
+          resumeId: created.id,
+          provenance: { source: 'RESUME_UPLOAD' },
         });
         return created;
       });
-      persisted = true;
       const facts = await replaceResumeCandidateFacts(resume.id, req.user!.userId);
 
       return res.status(201).json({
@@ -113,16 +102,13 @@ router.post('/upload', upload.single('resume'), async (req: AuthenticatedRequest
           factsPendingApproval: facts.filter((fact) => !fact.approved).length,
         },
       });
-    } catch (error) {
-      if (!persisted) await documentStorage.delete(stored).catch(() => undefined);
-      throw error;
     }
   } catch (error) {
     if (error instanceof DocumentStorageError) {
       const status = error.code === 'SCAN_UNAVAILABLE' || error.code === 'STORAGE_UNAVAILABLE' ? 503 : 400;
       return res.status(status).json({ success: false, error: error.message });
     }
-    console.error('Resume upload error:', error);
+    logRouteError('resume.upload_failure', error, { correlationId: req.get('x-correlation-id'), userId: req.user?.userId });
     return res.status(500).json({ success: false, error: 'Failed to upload resume' });
   }
 });
@@ -130,7 +116,7 @@ router.post('/upload', upload.single('resume'), async (req: AuthenticatedRequest
 // GET /api/resumes - List resumes
 router.get('/', async (req: AuthenticatedRequest, res: Response) => {
   try {
-    const resumes = await prisma.resume.findMany({
+    const resumes = await withTenant(req.user!.userId, tx => tx.resume.findMany({
       where: { userId: req.user!.userId },
       select: {
         id: true,
@@ -146,7 +132,7 @@ router.get('/', async (req: AuthenticatedRequest, res: Response) => {
         },
       },
       orderBy: { createdAt: 'desc' },
-    });
+    }));
     return res.json({ success: true, data: resumes });
   } catch (error) {
     return res.status(500).json({ success: false, error: 'Failed to fetch resumes' });
@@ -156,7 +142,7 @@ router.get('/', async (req: AuthenticatedRequest, res: Response) => {
 // GET /api/resumes/:id/facts - List parsed facts with exact citations
 router.get('/:id/facts', async (req: AuthenticatedRequest, res: Response) => {
   try {
-    const resume = await prisma.resume.findFirst({ where: { id: req.params.id, userId: req.user!.userId }, select: { id: true } });
+    const resume = await withTenant(req.user!.userId, tx => tx.resume.findFirst({ where: { id: req.params.id, userId: req.user!.userId }, select: { id: true } }));
     if (!resume) return res.status(404).json({ success: false, error: 'Resume not found' });
     const facts = await listResumeCandidateFacts(resume.id, req.user!.userId);
     return res.json({ success: true, data: facts });
@@ -195,8 +181,8 @@ router.post('/:id/tailor', async (req: AuthenticatedRequest, res: Response) => {
     const jobId = typeof req.body?.jobId === 'string' ? req.body.jobId.trim() : '';
     if (!resumeId || !jobId) return res.status(400).json({ success: false, error: 'resume and job identifiers are required' });
     const [resume, job] = await Promise.all([
-      prisma.resume.findFirst({ where: { id: resumeId, userId: req.user!.userId }, select: { id: true } }),
-      prisma.job.findUnique({ where: { id: jobId }, select: { id: true } }),
+      withTenant(req.user!.userId, tx => tx.resume.findFirst({ where: { id: resumeId, userId: req.user!.userId }, select: { id: true } })),
+      withTenant(req.user!.userId, tx => tx.job.findUnique({ where: { id: jobId }, select: { id: true } })),
     ]);
     if (!resume || !job) return res.status(404).json({ success: false, error: 'Resume or job not found' });
     const queued = await createAutomationJob({
@@ -220,10 +206,10 @@ router.post('/:id/versions/:versionId/evaluate-ats', async (req: AuthenticatedRe
     const resumeId = req.params.id.trim();
     const resumeVersionId = req.params.versionId.trim();
     if (!resumeId || !resumeVersionId) return res.status(400).json({ success: false, error: 'resume and version identifiers are required' });
-    const version = await prisma.resumeVersion.findFirst({
+    const version = await withTenant(req.user!.userId, tx => tx.resumeVersion.findFirst({
       where: { id: resumeVersionId, resumeId, resume: { userId: req.user!.userId } },
       select: { id: true },
-    });
+    }));
     if (!version) return res.status(404).json({ success: false, error: 'Resume version not found' });
     const queued = await createAutomationJob({
       userId: req.user!.userId,
@@ -242,13 +228,13 @@ router.post('/:id/versions/:versionId/evaluate-ats', async (req: AuthenticatedRe
 
 router.get('/:id/download', async (req: AuthenticatedRequest, res: Response) => {
   try {
-    const resume = await prisma.resume.findFirst({
+    const resume = await withTenant(req.user!.userId, tx => tx.resume.findFirst({
       where: { id: req.params.id, userId: req.user!.userId },
-      select: { objectMetadata: { select: { bucket: true, objectKey: true, versionId: true, fileName: true, mimeType: true, scanStatus: true, deletedAt: true } } },
-    });
+      select: { objectMetadata: { select: { userId: true, bucket: true, objectKey: true, versionId: true, fileName: true, mimeType: true, checksumSha256: true, byteSize: true, encryptionKeyRef: true, scanStatus: true, deletedAt: true, expiresAt: true } } },
+    }));
     const object = resume?.objectMetadata;
     if (!object || object.scanStatus !== 'CLEAN' || object.deletedAt) return res.status(404).json({ success: false, error: 'Resume document not found' });
-    const url = await documentStorage.signedDownloadUrl(object);
+    const url = await documentStorage.signedDownloadUrlAuthorized(req.user!.userId, object);
     return res.json({ success: true, data: { url, expiresInSeconds: 300 } });
   } catch (error) {
     if (error instanceof DocumentStorageError) return res.status(503).json({ success: false, error: error.message });
@@ -259,12 +245,12 @@ router.get('/:id/download', async (req: AuthenticatedRequest, res: Response) => 
 // GET /api/resumes/:id - Get resume detail
 router.get('/:id', async (req: AuthenticatedRequest, res: Response) => {
   try {
-    const resume = await prisma.resume.findFirst({
+    const resume = await withTenant(req.user!.userId, tx => tx.resume.findFirst({
       where: { id: req.params.id, userId: req.user!.userId },
       include: {
         versions: { orderBy: { generatedAt: 'desc' } },
       },
-    });
+    }));
     if (!resume) {
       return res.status(404).json({ success: false, error: 'Resume not found' });
     }
@@ -279,13 +265,13 @@ router.get('/:id', async (req: AuthenticatedRequest, res: Response) => {
 // GET /api/resumes/:id/versions - List versions
 router.get('/:id/versions', async (req: AuthenticatedRequest, res: Response) => {
   try {
-    const versions = await prisma.resumeVersion.findMany({
+    const versions = await withTenant(req.user!.userId, tx => tx.resumeVersion.findMany({
       where: {
         resumeId: req.params.id,
         resume: { userId: req.user!.userId },
       },
       orderBy: { generatedAt: 'desc' },
-    });
+    }));
     return res.json({ success: true, data: versions });
   } catch (error) {
     return res.status(500).json({ success: false, error: 'Failed to fetch versions' });

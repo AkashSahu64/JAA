@@ -2,6 +2,8 @@ import { describe, expect, it, vi } from 'vitest';
 import type { LeverFormPort } from '@jobagent/job-engine';
 import { LeverApplicationService } from './lever-application';
 
+const describeDatabase = process.env.DATABASE_INTEGRATION === '1' && Boolean(process.env.DATABASE_URL) ? describe : describe.skip;
+
 function formPort(snapshot: Awaited<ReturnType<LeverFormPort['snapshot']>>) {
   return {
     snapshot: vi.fn(async () => snapshot),
@@ -13,7 +15,7 @@ function formPort(snapshot: Awaited<ReturnType<LeverFormPort['snapshot']>>) {
   } satisfies LeverFormPort;
 }
 
-describe('LeverApplicationService', () => {
+describeDatabase('LeverApplicationService', () => {
   it('checks durable tenant data before opening a browser session', async () => {
     const browserSessions = {
       start: vi.fn(async () => ({ session: { externalRef: 'session' }, replayed: false })),

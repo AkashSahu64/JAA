@@ -12,6 +12,8 @@ import { GreenhouseApplicationService } from './greenhouse-application';
 import { LeverApplicationService } from './lever-application';
 import { AutomationJobRetryError } from './automation-jobs';
 import { recordAuthorizedSubmissionHandoff } from './submission-engine';
+import { ingestEmailOutcome } from './email-outcomes';
+import { verifySubmission } from './submission-verification';
 
 export type AutomationJobHandlerMap = ReadonlyMap<string, AutomationJobHandler>;
 
@@ -22,9 +24,12 @@ function payloadObject(context: AutomationJobHandlerContext): Record<string, Pri
   return context.payload as Record<string, Prisma.JsonValue>;
 }
 
-function requiredText(payload: Record<string, Prisma.JsonValue>, name: string): string {
+function requiredText(payload: Record<string, Prisma.JsonValue>, name: string, options: { allowControlCharacters?: boolean } = {}): string {
   const value = payload[name];
-  if (typeof value !== 'string' || !value.trim()) throw new Error(`${name} is required`);
+  if (typeof value !== 'string' || !value.trim() || value.length > 2_000_000
+    || (!options.allowControlCharacters && Array.from(value).some(character => character.charCodeAt(0) < 32 || character.charCodeAt(0) === 127))) {
+    throw new Error(`${name} is required and bounded`);
+  }
   return value.trim();
 }
 
@@ -173,13 +178,64 @@ async function executeLeverApplication(context: AutomationJobHandlerContext): Pr
 async function recordSubmissionHandoff(context: AutomationJobHandlerContext): Promise<void> {
   const payload = payloadObject(context);
   const authorizationId = requiredText(payload, 'authorizationId');
-  if (context.payloadVersion !== 1) throw new Error('RECORD_AUTHORIZED_SUBMISSION_HANDOFF payloadVersion must be 1');
+  if (context.payloadVersion !== 1) throw new Error('EXECUTE_AUTHORIZED_SUBMISSION payloadVersion must be 1');
   if (context.signal.aborted) throw abortError(context.signal);
   await context.heartbeat();
   await recordAuthorizedSubmissionHandoff({
     userId: context.userId,
     authorizationId,
     correlationId: context.correlationId,
+    workerId: context.workerId,
+  });
+  if (context.signal.aborted) throw abortError(context.signal);
+  await context.heartbeat();
+}
+
+async function ingestEmailOutcomeJob(context: AutomationJobHandlerContext): Promise<void> {
+  const payload = payloadObject(context);
+  if (context.payloadVersion !== 1) throw new Error('EMAIL_OUTCOME payloadVersion must be 1');
+  const receivedAtValue = requiredText(payload, 'receivedAt');
+  const receivedAt = new Date(receivedAtValue);
+  if (!Number.isFinite(receivedAt.getTime())) throw new Error('receivedAt is invalid');
+  if (context.signal.aborted) throw abortError(context.signal);
+  await context.heartbeat();
+  await ingestEmailOutcome({
+    userId: context.userId,
+    source: typeof payload.source === 'string' && payload.source.trim() ? payload.source.trim() : 'AUTOMATION',
+    messageId: requiredText(payload, 'messageId'),
+    sender: requiredText(payload, 'sender'),
+    subject: requiredText(payload, 'subject'),
+    body: requiredText(payload, 'body', { allowControlCharacters: true }),
+    receivedAt,
+    applicationId: typeof payload.applicationId === 'string' ? payload.applicationId.trim() || undefined : undefined,
+  });
+  if (context.signal.aborted) throw abortError(context.signal);
+  await context.heartbeat();
+}
+
+async function verifySubmissionConfirmationJob(context: AutomationJobHandlerContext): Promise<void> {
+  const payload = payloadObject(context);
+  const applicationId = requiredText(payload, 'applicationId');
+  const provider = requiredText(payload, 'provider');
+  const confirmationId = requiredText(payload, 'confirmationId');
+  const evidenceHash = requiredText(payload, 'evidenceHash');
+  const parserVersion = requiredText(payload, 'parserVersion');
+  const source = requiredText(payload, 'source');
+  const attemptId = payload.attemptId === undefined ? undefined : requiredText(payload, 'attemptId');
+  const observedAtValue = requiredText(payload, 'observedAt');
+  if (context.payloadVersion !== 1) throw new Error('VERIFY_SUBMISSION_CONFIRMATION payloadVersion must be 1');
+  if (provider !== 'GREENHOUSE' && provider !== 'LEVER') throw new Error('provider is invalid');
+  if (!['CONFIRMATION_PAGE', 'PROVIDER_RESPONSE', 'APPLICATION_ID'].includes(source)) throw new Error('source is invalid');
+  const observedAt = new Date(observedAtValue);
+  if (!Number.isFinite(observedAt.getTime())) throw new Error('observedAt is invalid');
+  if (context.signal.aborted) throw abortError(context.signal);
+  await context.heartbeat();
+  await verifySubmission({
+    userId: context.userId,
+    applicationId,
+    correlationId: context.correlationId,
+    trustedBoundary: true,
+    evidence: { applicationId, attemptId, provider, confirmationId, evidenceHash, parserVersion, observedAt, source } as Parameters<typeof verifySubmission>[0]['evidence'],
   });
   if (context.signal.aborted) throw abortError(context.signal);
   await context.heartbeat();
@@ -225,7 +281,9 @@ export function createProductionAutomationJobHandlers(
     ['EVALUATE_APPLICATION_QUALITY', evaluateApplicationQuality],
     ['COMPLETE_GREENHOUSE_APPLICATION', executeGreenhouseApplication],
     ['COMPLETE_LEVER_APPLICATION', executeLeverApplication],
-    ['RECORD_AUTHORIZED_SUBMISSION_HANDOFF', recordSubmissionHandoff],
+    ['EXECUTE_AUTHORIZED_SUBMISSION', recordSubmissionHandoff],
+    ['EMAIL_OUTCOME', ingestEmailOutcomeJob],
+    ['VERIFY_SUBMISSION_CONFIRMATION', verifySubmissionConfirmationJob],
     ['RESUME_APPLICATION_AFTER_VERIFICATION', resumeApplicationAfterVerification],
     ['DISCOVER_JOBS', discoveryHandler(dependencies.executeDiscoveryRun ?? executeDiscoveryRun)],
   ]);

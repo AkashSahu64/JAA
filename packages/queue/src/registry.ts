@@ -30,6 +30,21 @@ export interface QueueRegistryOptions extends QueueConnectionConfig {
   defaultJobOptions?: JobsOptions;
 }
 
+const SAFE_QUEUE_TEXT = /^[A-Za-z0-9._:-]{1,200}$/;
+
+export function validateEnqueueAutomationJobInput(input: EnqueueAutomationJobInput): void {
+  if (!input || typeof input !== 'object') throw new Error('Queue envelope is required');
+  for (const [value, name] of [[input?.automationJobId, 'automationJobId'], [input?.type, 'type'], [input?.correlationId, 'correlationId']] as const) {
+    if (typeof value !== 'string' || !SAFE_QUEUE_TEXT.test(value.trim())) throw new Error(`${name} must be a bounded control-free identifier`);
+  }
+  if (!Number.isSafeInteger(input.payloadVersion) || input.payloadVersion < 1) throw new Error('payloadVersion must be a positive integer');
+  if (!Number.isSafeInteger(input.deliveryGeneration) || input.deliveryGeneration < 1) throw new Error('deliveryGeneration must be a positive integer');
+  if (!Number.isSafeInteger(input.dispatchAttempt) || input.dispatchAttempt < 1) throw new Error('dispatchAttempt must be a positive integer');
+  if (!Number.isSafeInteger(input.maxAttempts) || input.maxAttempts < 1) throw new Error('maxAttempts must be a positive integer');
+  if (!Number.isSafeInteger(input.priority)) throw new Error('priority must be a safe integer');
+  if (!(input.availableAt instanceof Date) || !Number.isFinite(input.availableAt.getTime())) throw new Error('availableAt must be a valid Date');
+}
+
 export function queueJobId(automationJobId: string, dispatchAttempt: number): string {
   return `${automationJobId}-${dispatchAttempt}`;
 }
@@ -63,6 +78,7 @@ export class AutomationQueueRegistry {
   }
 
   async enqueue(input: EnqueueAutomationJobInput): Promise<void> {
+    validateEnqueueAutomationJobInput(input);
     const name = queueForJobType(input.type);
     await this.queue(name).add(input.type, {
       automationJobId: input.automationJobId,

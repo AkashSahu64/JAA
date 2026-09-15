@@ -3,6 +3,7 @@ import { encrypt, decrypt } from './encryption';
 
 export interface StoredCredential {
   id: string;
+  ownerId: string;
   name: string;
   encryptedValue: string;
   createdAt: Date;
@@ -17,7 +18,14 @@ const MAX_CREDENTIAL_NAME_LENGTH = 200;
 const MAX_CREDENTIAL_VALUE_LENGTH = 100_000;
 
 export class CredentialVault {
-  async store(name: string, value: string): Promise<string> {
+  constructor() {
+    if (process.env.NODE_ENV === 'production') {
+      throw new Error('CredentialVault is process-local and disabled in production; use durable tenant-scoped credentials');
+    }
+  }
+
+  async store(ownerId: string, name: string, value: string): Promise<string> {
+    validateOwner(ownerId);
     validateCredential(name, value);
     const id = randomUUID();
     const normalizedName = name.trim();
@@ -25,6 +33,7 @@ export class CredentialVault {
     
     credentialStore.set(id, {
       id,
+      ownerId,
       name: normalizedName,
       encryptedValue,
       createdAt: new Date(),
@@ -34,35 +43,45 @@ export class CredentialVault {
     return id;
   }
   
-  async retrieve(id: string): Promise<string | null> {
+  async retrieve(ownerId: string, id: string): Promise<string | null> {
+    validateOwner(ownerId);
     const credential = credentialStore.get(id);
-    if (!credential) return null;
+    if (!credential || credential.ownerId !== ownerId) return null;
     
     credential.lastAccessedAt = new Date();
     return decrypt(credential.encryptedValue);
   }
   
-  async update(id: string, value: string): Promise<boolean> {
+  async update(ownerId: string, id: string, value: string): Promise<boolean> {
+    validateOwner(ownerId);
     validateCredentialValue(value);
     const credential = credentialStore.get(id);
-    if (!credential) return false;
+    if (!credential || credential.ownerId !== ownerId) return false;
     
     credential.encryptedValue = encrypt(value);
     credential.updatedAt = new Date();
     return true;
   }
   
-  async delete(id: string): Promise<boolean> {
+  async delete(ownerId: string, id: string): Promise<boolean> {
+    validateOwner(ownerId);
+    const credential = credentialStore.get(id);
+    if (!credential || credential.ownerId !== ownerId) return false;
     return credentialStore.delete(id);
   }
   
-  async list(): Promise<Array<{ id: string; name: string; createdAt: Date }>> {
-    return Array.from(credentialStore.values()).map(c => ({
+  async list(ownerId: string): Promise<Array<{ id: string; name: string; createdAt: Date }>> {
+    validateOwner(ownerId);
+    return Array.from(credentialStore.values()).filter(c => c.ownerId === ownerId).map(c => ({
       id: c.id,
       name: c.name,
       createdAt: c.createdAt,
     }));
   }
+}
+
+function validateOwner(ownerId: string): void {
+  if (typeof ownerId !== 'string' || !/^[A-Za-z0-9._:-]{1,200}$/.test(ownerId)) throw new Error('Credential owner is required');
 }
 
 function validateCredential(name: string, value: string): void {

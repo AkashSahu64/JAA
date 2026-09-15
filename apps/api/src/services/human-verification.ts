@@ -9,7 +9,7 @@ const expiredStatus = 'EXPIRED';
 const cancelledStatus = 'CANCELLED';
 
 function resumeStatusFor(applicationStatus: string): ApplicationStatus {
-  return applicationStatus === 'READY_TO_SUBMIT'
+  return applicationStatus === 'READY_TO_SUBMIT' || applicationStatus === 'SUBMISSION_PENDING'
     ? ApplicationStatus.READY_TO_SUBMIT
     : ApplicationStatus.FORM_FILLED;
 }
@@ -88,7 +88,7 @@ export async function requestHumanVerification(input: RequestHumanVerificationIn
     });
     const application = await tx.application.findFirst({ where: { id: input.applicationId, userId: input.userId } });
     if (!application) throw new HumanVerificationError('NOT_FOUND', 'Application not found');
-    if (!['APPLICATION_STARTED', 'FORM_FILLED', 'READY_TO_SUBMIT', 'WAITING_FOR_USER'].includes(application.status)) {
+    if (!['APPLICATION_STARTED', 'FORM_FILLED', 'READY_TO_SUBMIT', 'SUBMISSION_PENDING', 'WAITING_FOR_USER'].includes(application.status)) {
       throw new HumanVerificationError('CONFLICT', 'Application is not at a human-verification checkpoint');
     }
     const pending = await tx.humanVerification.findFirst({ where: { userId: input.userId, applicationId: input.applicationId, status: pendingStatus } });
@@ -109,7 +109,7 @@ export async function requestHumanVerification(input: RequestHumanVerificationIn
     }
     await Promise.all([
       tx.auditLog.create({ data: { userId: input.userId, action: 'HUMAN_VERIFICATION_REQUESTED', resource: 'HumanVerification', resourceId: verification.id, details: { applicationId: application.id, type: input.type, expiresAt: input.expiresAt.toISOString() } } }),
-      tx.outboxEvent.create({ data: { userId: input.userId, aggregateType: 'HumanVerification', aggregateId: verification.id, eventType: 'human-verification.requested', payload: { applicationId: application.id, type: input.type, expiresAt: input.expiresAt.toISOString() }, schemaVersion: 1, correlationId: input.correlationId, idempotencyKey: `human-verification-requested:${verification.id}` } }),
+      tx.outboxEvent.create({ data: { userId: input.userId, aggregateType: 'HumanVerification', aggregateId: verification.id, eventType: 'human-verification.requested', payload: { applicationId: application.id, verificationId: verification.id, type: input.type, expiresAt: input.expiresAt.toISOString() }, schemaVersion: 1, correlationId: input.correlationId, idempotencyKey: `human-verification-requested:${verification.id}` } }),
     ]);
     return { verification, replayed: false as const };
   });

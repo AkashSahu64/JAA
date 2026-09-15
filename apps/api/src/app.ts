@@ -17,6 +17,11 @@ import { sseRoutes } from './routes/sse';
 import { aiRoutes } from './routes/ai';
 import { errorHandler } from './middleware/error-handler';
 import { requestLogger } from './middleware/request-logger';
+import { prisma } from '@jobagent/database';
+import { emailOutcomeRoutes } from './routes/email-outcomes';
+import { emailConnectionRoutes } from './routes/email-connections';
+import { documentRoutes } from './routes/documents';
+import { logRouteError, writeStructuredLog } from './observability/structured-log';
 
 export function createApp() {
   const app = express();
@@ -40,8 +45,23 @@ export function createApp() {
   app.use('/api/rules', ruleRoutes);
   app.use('/api/sse', sseRoutes);
   app.use('/api/ai', aiRoutes);
+  app.use('/api/email-outcomes', emailOutcomeRoutes);
+  app.use('/api/email-connections', emailConnectionRoutes);
+  app.use('/api/documents', documentRoutes);
   app.get('/api/health', (_, res) => res.json({ status: 'ok', timestamp: new Date().toISOString() }));
-  app.use((_req, res) => { res.status(404).json({ success: false, error: 'Route not found' }); });
+  app.get('/api/ready', async (_, res) => {
+    try {
+      await prisma.$queryRaw`SELECT 1`;
+      return res.json({ status: 'ready', checks: { database: 'ok' }, timestamp: new Date().toISOString() });
+    } catch (error) {
+      logRouteError('api.readiness_failure', error, { correlationId: _.get('x-correlation-id') });
+      return res.status(503).json({ status: 'not_ready', checks: { database: 'unavailable' }, timestamp: new Date().toISOString() });
+    }
+  });
+  app.use((req, res) => {
+    writeStructuredLog('warn', { event: 'http.route_not_found', correlationId: req.get('x-correlation-id'), method: req.method, path: req.path });
+    res.status(404).json({ success: false, error: 'Route not found' });
+  });
   app.use(errorHandler);
   return app;
 }

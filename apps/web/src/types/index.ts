@@ -85,6 +85,73 @@ export interface ApplicationAttempt {
   fieldsFilled: number;
 }
 
+export interface UIApplicationJob {
+  id: string;
+  type: string;
+  status: string;
+  availableAt: string;
+  attemptCount: number;
+  completedAt?: string;
+  cancelledAt?: string;
+  lastError?: string;
+}
+
+export interface UIInterview {
+  id: string;
+  date?: string;
+  type: string;
+  company: string;
+  role: string;
+  round: number;
+  interviewer?: string;
+  meetingUrl?: string;
+  result?: string;
+}
+
+export interface OfferRecord {
+  id: string;
+  company: string;
+  role: string;
+  salaryOffered?: number;
+  currency?: string;
+  startDate?: string;
+  expiresAt?: string;
+  status: string;
+}
+
+export interface UIEmailOutcome {
+  id: string;
+  applicationId?: string;
+  classification: string;
+  confidence: string;
+  receivedAt: string;
+  reviewedAt?: string;
+  reviewedBy?: string;
+  createdAt: string;
+}
+
+export interface UIEmailConnection {
+  id: string;
+  provider: string;
+  accountLabel: string;
+  scopes: string[];
+  status: string;
+  grantedAt?: string;
+  revokedAt?: string;
+  lastSyncAt?: string;
+}
+
+export interface UISearchProfile {
+  id: string;
+  name: string;
+  schedule: string;
+  isActive: boolean;
+  timeZone?: string;
+  maxApplicationsPerDay?: number;
+  nextRunAt?: string;
+  lastRunAt?: string;
+}
+
 export interface UIApplication {
   id: string;
   jobId: string;
@@ -92,6 +159,7 @@ export interface UIApplication {
   role: string;
   location?: string;
   status: string;
+  version?: number;
   matchScore?: number;
   atsScore?: number;
   appliedAt?: string;
@@ -99,6 +167,10 @@ export interface UIApplication {
   retryCount: number;
   failureReason?: string;
   attempts?: ApplicationAttempt[];
+  interviews?: UIInterview[];
+  offers?: OfferRecord[];
+  emailOutcomes?: UIEmailOutcome[];
+  jobs?: UIApplicationJob[];
 }
 
 export interface UIResumeVersion {
@@ -144,10 +216,29 @@ export interface DashboardStats {
   applicationsThisMonth: number;
   interviewRate: number;
   responseRate: number;
+  offerRate?: number;
+  rejectionRate?: number;
+  submissionSuccessRate?: number;
   averageMatchScore: number;
   averageATSScore: number;
   pendingApplications: number;
   failedApplications: number;
+  lifecycleCounts?: Record<string, number>;
+  providerMetrics?: Record<string, { total: number; confirmed: number; failed: number; confirmedRate: number }>;
+  roleMetrics?: Record<string, { total: number; confirmed: number; failed: number; confirmedRate: number }>;
+  failureReasons?: Record<string, number>;
+  resumeVersionPerformance?: Record<string, { applications: number; confirmed: number; failed: number }>;
+  atsScoreDistribution?: { below60: number; from60To79: number; from80To89: number; from90To100: number };
+  averageTimeToConfirmationHours?: number;
+  averageTimeToSubmissionHours?: number;
+  interviewRounds?: { total: number; highestRound: number; byRound: Record<string, number> };
+  offerOutcomes?: { total: number; byStatus: Record<string, number> };
+}
+
+export interface ApplicationFunnelRow {
+  date: string;
+  total: number;
+  statuses: Record<string, number>;
 }
 
 export interface AutomationRun {

@@ -23,6 +23,10 @@ describe('BrowserNavigationPolicy', () => {
       allowed: false,
       reason: 'HTTPS_REQUIRED',
     });
+    expect(policy.evaluate('https://jobs.example.invalid:8443/apply')).toMatchObject({
+      allowed: false,
+      reason: 'HTTPS_PORT_NOT_ALLOWED',
+    });
   });
 
   it('matches host labels rather than confusing malicious suffixes', () => {
@@ -85,6 +89,49 @@ describe('BrowserNavigationPolicy', () => {
       'https://jobs.example.invalid/start',
       'https://evil.invalid/',
     )).toThrow(BrowserNavigationPolicyError);
+  });
+
+  it('fails closed when an allowlisted hostname resolves to an internal address', async () => {
+    const resolvingPolicy = new BrowserNavigationPolicy({
+      allowedHosts: ['jobs.example.invalid'],
+      resolveHostname: async () => ['93.184.216.34', '10.0.0.7'],
+    });
+
+    await expect(resolvingPolicy.evaluateResolved('https://jobs.example.invalid/apply')).resolves.toMatchObject({
+      allowed: false,
+      reason: 'BLOCKED_RESOLVED_IP',
+      blockedIpCategory: 'PRIVATE',
+    });
+  });
+
+  it('fails closed when DNS resolution fails or returns no addresses', async () => {
+    const rejected = new BrowserNavigationPolicy({
+      allowedHosts: ['jobs.example.invalid'],
+      resolveHostname: async () => { throw new Error('resolver unavailable'); },
+    });
+    const empty = new BrowserNavigationPolicy({
+      allowedHosts: ['jobs.example.invalid'],
+      resolveHostname: async () => [],
+    });
+
+    await expect(rejected.evaluateResolved('https://jobs.example.invalid')).resolves.toMatchObject({
+      allowed: false,
+      reason: 'DNS_RESOLUTION_FAILED',
+    });
+    await expect(empty.evaluateResolved('https://jobs.example.invalid')).resolves.toMatchObject({
+      allowed: false,
+      reason: 'DNS_RESOLUTION_FAILED',
+    });
+  });
+
+  it('allows an allowlisted hostname only when every resolved address is public', async () => {
+    const resolvingPolicy = new BrowserNavigationPolicy({
+      allowedHosts: ['jobs.example.invalid'],
+      resolveHostname: async () => ['93.184.216.34'],
+    });
+
+    await expect(resolvingPolicy.assertResolvedAllowed('https://jobs.example.invalid/apply'))
+      .resolves.toEqual(new URL('https://jobs.example.invalid/apply'));
   });
 });
 

@@ -1,104 +1,51 @@
 import {
-  assessApplicationForm,
+  ApplicationFormAdapter,
+  normalizeApplicationFormSnapshot,
   type ApplicationFormAssessment,
   type ApplicationFormField,
   type ApplicationFormProfileKey,
+  type ApplicationFormFillResult,
+  type ApplicationFormPort,
+  type ApplicationFormSnapshot,
+  type FormDetector,
 } from '../form-intelligence';
+import { safeProviderApplicationHost } from './provider-host';
 
 export type GreenhouseField = ApplicationFormField;
 
-export interface GreenhouseFormSnapshot {
-  step: number;
+export interface GreenhouseFormSnapshot extends ApplicationFormSnapshot {
+  provider?: ApplicationFormSnapshot['provider'];
+  stepIdentity?: string;
   fields: readonly GreenhouseField[];
-  hasNextStep: boolean;
 }
 
-export interface ApprovedGreenhouseProfile {
-  readonly firstName?: string;
-  readonly lastName?: string;
-  readonly email?: string;
-  readonly phone?: string;
-  readonly location?: string;
-  readonly linkedinUrl?: string;
-  readonly websiteUrl?: string;
+export type ApprovedGreenhouseProfile = Readonly<Partial<Record<ApplicationFormProfileKey, string>>>;
+export type GreenhouseFormPort = ApplicationFormPort<GreenhouseFormSnapshot>;
+export type GreenhouseFillResult = ApplicationFormFillResult;
+
+export function greenhouseApplicationHost(url: string): string | null {
+  return safeProviderApplicationHost(url, ['boards.greenhouse.io', 'job-boards.greenhouse.io']);
 }
 
-export interface GreenhouseFormPort {
-  snapshot(): Promise<GreenhouseFormSnapshot>;
-  fill(fieldId: string, value: string): Promise<void>;
-  select(fieldId: string, value: string): Promise<void>;
-  setChecked(fieldId: string, checked: boolean): Promise<void>;
-  validate(): Promise<readonly { fieldId?: string; message: string }[]>;
-  advance(): Promise<void>;
-}
+const greenhouseDetector: FormDetector<GreenhouseFormPort> = {
+  detect: async port => {
+    const raw = await port.snapshot();
+    const hasProvider = Boolean(raw && typeof raw === 'object' && !Array.isArray(raw) && Object.prototype.hasOwnProperty.call(raw, 'provider'));
+    if (hasProvider && (raw as ApplicationFormSnapshot).provider !== 'GREENHOUSE') {
+      return { provider: 'UNKNOWN', step: 0, stepIdentity: 'default', fields: [], hasNextStep: false, validationErrors: [] };
+    }
+    const snapshot = normalizeApplicationFormSnapshot(raw);
+    return snapshot.provider === 'UNKNOWN' ? { ...snapshot, provider: 'GREENHOUSE' } : snapshot;
+  },
+};
 
-export interface GreenhouseFillResult {
-  step: number;
-  fields: readonly GreenhouseField[];
-  filledFieldIds: string[];
-  requiredBlockingFieldIds: string[];
-  assessments: ApplicationFormAssessment[];
-  validationErrors: readonly { fieldId?: string; message: string }[];
-  advanced: boolean;
-}
-
-function usableValue(
-  profile: ApprovedGreenhouseProfile,
-  key: ApplicationFormProfileKey,
-): string | undefined {
-  const value = profile[key]?.trim();
-  return value || undefined;
-}
-
-export class GreenhouseApplicationAdapter {
-  inspect(snapshot: GreenhouseFormSnapshot): ApplicationFormAssessment[] {
-    return assessApplicationForm(snapshot.fields)
-      .filter(assessment => snapshot.fields.some(field =>
-        field.id === assessment.fieldId && field.kind !== 'HIDDEN',
-      ));
+/** Greenhouse provider boundary; shared policy and answer handling live in form-intelligence. */
+export class GreenhouseApplicationAdapter extends ApplicationFormAdapter<GreenhouseFormPort> {
+  constructor() {
+    super(greenhouseDetector);
   }
 
-  async fillCurrentStep(
-    port: GreenhouseFormPort,
-    profile: ApprovedGreenhouseProfile,
-  ): Promise<GreenhouseFillResult> {
-    const snapshot = await port.snapshot();
-    const assessments = this.inspect(snapshot);
-    const filledFieldIds: string[] = [];
-    for (const assessment of assessments) {
-      if (assessment.disposition !== 'PROFILE_DERIVED' || !assessment.profileKey) continue;
-      const value = usableValue(profile, assessment.profileKey);
-      if (!value) continue;
-      const field = snapshot.fields.find(candidate => candidate.id === assessment.fieldId);
-      if (!field) continue;
-      if (field.kind === 'SELECT') {
-        if (!field.options?.some(option => option.trim() === value)) continue;
-        await port.select(field.id, value);
-      } else if (field.kind === 'CHECKBOX') {
-        continue;
-      } else {
-        await port.fill(field.id, value);
-      }
-      filledFieldIds.push(field.id);
-    }
-    const validationErrors = await port.validate();
-    const requiredBlockingFieldIds = snapshot.fields
-      .filter(field => field.required && (
-        !assessments.some(assessment =>
-          assessment.fieldId === field.id && assessment.disposition === 'PROFILE_DERIVED',
-        ) || !filledFieldIds.includes(field.id)
-      ))
-      .map(field => field.id);
-    const advanced = snapshot.hasNextStep && !validationErrors.length && !requiredBlockingFieldIds.length;
-    if (advanced) await port.advance();
-    return {
-      step: snapshot.step,
-      fields: snapshot.fields,
-      filledFieldIds,
-      requiredBlockingFieldIds,
-      assessments,
-      validationErrors,
-      advanced,
-    };
+  inspect(snapshot: GreenhouseFormSnapshot): ApplicationFormAssessment[] {
+    return super.inspect(snapshot);
   }
 }

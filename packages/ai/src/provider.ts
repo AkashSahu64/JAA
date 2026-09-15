@@ -75,7 +75,7 @@ let providerInstance: AIProvider | null = null;
 
 export function getAIProvider(): AIProvider {
   if (!providerInstance) {
-    const provider = (process.env.AI_PROVIDER || 'openai').toLowerCase();
+    const provider = (process.env.AI_PROVIDER || 'openai').trim().toLowerCase();
     switch (provider) {
       case 'openai':
         providerInstance = new OpenAIProvider();

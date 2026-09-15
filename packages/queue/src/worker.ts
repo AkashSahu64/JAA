@@ -44,7 +44,13 @@ export interface AutomationWorkerOptions extends QueueConnectionConfig {
   onRenew: (message: AutomationQueueMessage, leaseMs: number) => Promise<void>;
   /** Identifies an onRenew failure that conclusively means this worker no longer owns the lease. */
   isLeaseLost?: (error: unknown) => boolean;
+  /** Receives timer-driven renewal failures so operational signals are not silently discarded. */
+  onHeartbeatError?: (message: AutomationQueueMessage, error: Error) => void;
+  /** Receives BullMQ connection/worker errors that are not tied to one delivery. */
+  onWorkerError?: (error: Error) => void;
 }
+
+export const MAX_RETRY_DELAY_MS = 24 * 60 * 60 * 1_000;
 
 function errorFrom(value: unknown): Error {
   return value instanceof Error ? value : new Error(String(value));
@@ -61,13 +67,17 @@ export function retryJitter(automationJobId: string, attempt: number): number {
 }
 
 export function retryDelayMs(attempt: number, baseMs = 1_000, jitter = Math.random()): number {
-  const exponential = baseMs * 2 ** Math.max(0, attempt - 1);
-  return Math.round(exponential * (0.75 + Math.max(0, Math.min(1, jitter)) * 0.5));
+  if (!Number.isSafeInteger(attempt) || attempt < 1) throw new Error('Retry attempt must be a positive integer');
+  if (!Number.isSafeInteger(baseMs) || baseMs < 1) throw new Error('Retry base delay must be a positive integer');
+  const boundedJitter = Number.isFinite(jitter) ? Math.max(0, Math.min(1, jitter)) : 0.5;
+  const exponential = Math.min(MAX_RETRY_DELAY_MS, baseMs * 2 ** Math.min(30, attempt - 1));
+  return Math.min(MAX_RETRY_DELAY_MS, Math.max(1, Math.round(exponential * (0.75 + boundedJitter * 0.5))));
 }
 
 export class AutomationQueueWorker {
   private readonly worker: Worker<AutomationQueueMessage, AutomationWorkerResult | void>;
   private readonly deadLetterQueue: Queue<AutomationQueueMessage>;
+  private readonly activeControllers = new Set<AbortController>();
 
   constructor(name: QueueName, options: AutomationWorkerOptions) {
     const connection = redisConnection(options);
@@ -76,6 +86,7 @@ export class AutomationQueueWorker {
     this.deadLetterQueue = new Queue(deadLetterQueueName(name), { connection, prefix });
     this.worker = new Worker<AutomationQueueMessage, AutomationWorkerResult | void>(name, async (job) => {
       const controller = new AbortController();
+      this.activeControllers.add(controller);
       let renewal: Promise<void> | undefined;
       const renew = async () => {
         try {
@@ -93,7 +104,11 @@ export class AutomationQueueWorker {
         }
         return renewal;
       };
-      const timer = setInterval(() => void heartbeat().catch(() => undefined), Math.max(1_000, Math.floor(leaseMs / 3)));
+      const timer = setInterval(() => {
+        void heartbeat().catch(value => {
+          options.onHeartbeatError?.(job.data, errorFrom(value));
+        });
+      }, Math.max(1_000, Math.floor(leaseMs / 3)));
       timer.unref();
       try {
         const result = await options.processor(job.data, { workerId: options.workerId, signal: controller.signal, heartbeat });
@@ -113,6 +128,7 @@ export class AutomationQueueWorker {
       } finally {
         clearInterval(timer);
         await renewal?.catch(() => undefined);
+        this.activeControllers.delete(controller);
       }
     }, {
       connection,
@@ -144,6 +160,7 @@ export class AutomationQueueWorker {
       },
       autorun: true,
     });
+    this.worker.on?.('error', (value: unknown) => options.onWorkerError?.(errorFrom(value)));
   }
 
   private async deadLetter(job: Job<AutomationQueueMessage>, error: Error): Promise<void> {
@@ -164,6 +181,11 @@ export class AutomationQueueWorker {
   }
 
   async close(force = false): Promise<void> {
+    if (force) {
+      for (const controller of this.activeControllers) {
+        if (!controller.signal.aborted) controller.abort(new Error('Automation worker is shutting down'));
+      }
+    }
     await this.worker.close(force);
     await this.deadLetterQueue.close();
   }

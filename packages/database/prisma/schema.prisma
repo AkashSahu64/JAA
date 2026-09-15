@@ -23,6 +23,7 @@ enum ApplicationStatus {
   SUBMITTED
   UNCONFIRMED
   CONFIRMED
+  ASSESSMENT
   FAILED
   RETRY_PENDING
   INTERVIEW
@@ -108,34 +109,40 @@ model User {
   lastLoginAt  DateTime?
   isActive     Boolean   @default(true)
 
-  profile                UserProfile?
-  searchProfiles         SearchProfile[]
-  resumes                Resume[]
-  coverLetters           CoverLetter[]
-  offers                 Offer[]
-  applications           Application[]
-  automationRuns         AutomationRun[]
-  notifications          Notification[]
-  rules                  UserRule[]
-  auditLogs              AuditLog[]
-  interviews             Interview[]
-  jobMatches             JobMatch[]
-  automationJobs         AutomationJob[]
-  outboxEvents           OutboxEvent[]
-  idempotencyRecords     IdempotencyRecord[]
-  applicationTransitions ApplicationStatusTransition[]
-  failures               FailureRecord[]
-  humanVerifications     HumanVerification[]
-  browserSessions        BrowserSessionReference[]
-  resumeSourceFacts      ResumeSourceFact[]
-  applicationQuestions   ApplicationQuestion[]
-  applicationAnswers     ApplicationAnswer[]
-  embeddings             Embedding[]
-  objects                ObjectMetadata[]
-  jobDiscoveryRuns       JobDiscoveryRun[]
-  jobDiscoveryItems      JobDiscoveryItem[]
-  qualityDecisions       ApplicationQualityDecision[]
-  submissionAuthorizations SubmissionAuthorization[]
+  profile                            UserProfile?
+  searchProfiles                     SearchProfile[]
+  resumes                            Resume[]
+  coverLetters                       CoverLetter[]
+  offers                             Offer[]
+  applications                       Application[]
+  automationRuns                     AutomationRun[]
+  notifications                      Notification[]
+  rules                              UserRule[]
+  auditLogs                          AuditLog[]
+  interviews                         Interview[]
+  jobMatches                         JobMatch[]
+  automationJobs                     AutomationJob[]
+  outboxEvents                       OutboxEvent[]
+  idempotencyRecords                 IdempotencyRecord[]
+  applicationTransitions             ApplicationStatusTransition[]
+  failures                           FailureRecord[]
+  humanVerifications                 HumanVerification[]
+  browserSessions                    BrowserSessionReference[]
+  resumeSourceFacts                  ResumeSourceFact[]
+  applicationQuestions               ApplicationQuestion[]
+  applicationAnswers                 ApplicationAnswer[]
+  embeddings                         Embedding[]
+  objects                            ObjectMetadata[]
+  jobDiscoveryRuns                   JobDiscoveryRun[]
+  jobDiscoveryItems                  JobDiscoveryItem[]
+  qualityDecisions                   ApplicationQualityDecision[]
+  submissionAuthorizations           SubmissionAuthorization[]
+  submissionVerificationEvidence     SubmissionVerificationEvidence[]
+  emailOutcomes                      EmailOutcome[]
+  emailConnections                   EmailConnection[]
+  emailOAuthStates                   EmailOAuthState[]
+  credentials                        CredentialRecord[]
+  refreshTokenSessions               RefreshTokenSession[]
   dailyApplicationBudgetReservations DailyApplicationBudgetReservation[]
 
   @@map("users")
@@ -224,6 +231,10 @@ model SearchProfile {
   maxApplicationsPerDay Int               @default(50)
   schedule              String            @default("ONCE")
   customCron            String?
+  discoveryAccounts     Json              @default("[]")
+  timeZone              String            @default("UTC")
+  nextRunAt             DateTime?
+  lastRunAt             DateTime?
   isActive              Boolean           @default(true)
   discoveryRuns         JobDiscoveryRun[]
 
@@ -247,9 +258,9 @@ model Resume {
   parsedData Json? // Structured parsed data
   version    Int     @default(1)
 
-  versions        ResumeVersion[]
-  sourceFacts     ResumeSourceFact[]
-  objectMetadata  ObjectMetadata?
+  versions       ResumeVersion[]
+  sourceFacts    ResumeSourceFact[]
+  objectMetadata ObjectMetadata?
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -279,6 +290,7 @@ model ResumeVersion {
 
   filePath           String?
   sourceFactsRecords ResumeSourceFact[]
+  objectMetadata     ObjectMetadata?
 
   applications Application[]
 
@@ -543,20 +555,22 @@ model Application {
   automationRunId String?
   automationRun   AutomationRun? @relation(fields: [automationRunId], references: [id])
 
-  attempts            ApplicationAttempt[]
-  documents           ApplicationDocument[]
-  interviews          Interview[]
-  offers              Offer[]
-  transitions         ApplicationStatusTransition[]
-  failures            FailureRecord[]
-  verifications       HumanVerification[]
-  browserSessions     BrowserSessionReference[]
-  questionsNormalized ApplicationQuestion[]
-  answersNormalized   ApplicationAnswer[]
-  jobs                AutomationJob[]
-  qualityDecisions          ApplicationQualityDecision[]
-  submissionAuthorizations SubmissionAuthorization[]
-  dailyBudgetReservation   DailyApplicationBudgetReservation?
+  attempts                       ApplicationAttempt[]
+  documents                      ApplicationDocument[]
+  interviews                     Interview[]
+  offers                         Offer[]
+  transitions                    ApplicationStatusTransition[]
+  failures                       FailureRecord[]
+  verifications                  HumanVerification[]
+  browserSessions                BrowserSessionReference[]
+  questionsNormalized            ApplicationQuestion[]
+  answersNormalized              ApplicationAnswer[]
+  jobs                           AutomationJob[]
+  qualityDecisions               ApplicationQualityDecision[]
+  submissionAuthorizations       SubmissionAuthorization[]
+  submissionVerificationEvidence SubmissionVerificationEvidence[]
+  emailOutcomes                  EmailOutcome[]
+  dailyBudgetReservation         DailyApplicationBudgetReservation?
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -609,6 +623,125 @@ model SubmissionAuthorization {
   @@map("submission_authorizations")
 }
 
+model SubmissionVerificationEvidence {
+  id             String              @id @default(uuid())
+  userId         String
+  user           User                @relation(fields: [userId], references: [id], onDelete: Cascade)
+  applicationId  String
+  application    Application         @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+  attemptId      String?
+  attempt        ApplicationAttempt? @relation(fields: [attemptId], references: [id], onDelete: SetNull)
+  provider       String
+  confirmationId String
+  evidenceHash   String
+  parserVersion  String
+  source         String
+  observedAt     DateTime
+  createdAt      DateTime            @default(now())
+
+  @@unique([applicationId, evidenceHash])
+  @@index([userId, createdAt])
+  @@index([applicationId, createdAt])
+  @@index([attemptId])
+  @@map("submission_verification_evidence")
+}
+
+model EmailOutcome {
+  id             String       @id @default(uuid())
+  userId         String
+  user           User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  applicationId  String?
+  application    Application? @relation(fields: [applicationId], references: [id], onDelete: SetNull)
+  source         String       @default("MANUAL")
+  messageId      String
+  senderHash     String
+  subjectHash    String
+  bodyHash       String
+  classification String
+  confidence     String
+  evidence       Json
+  receivedAt     DateTime
+  reviewedAt     DateTime?
+  reviewedBy     String?
+  createdAt      DateTime     @default(now())
+
+  @@unique([userId, messageId])
+  @@index([userId, classification, receivedAt])
+  @@index([applicationId, receivedAt])
+  @@map("email_outcomes")
+}
+
+model EmailConnection {
+  id            String    @id @default(uuid())
+  userId        String
+  user          User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  provider      String
+  accountLabel  String
+  scopes        String[]  @default([])
+  status        String    @default("ACTIVE")
+  credentialRef String?
+  grantedAt     DateTime  @default(now())
+  revokedAt     DateTime?
+  lastSyncAt    DateTime?
+  syncCursor    String?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  @@unique([userId, provider, accountLabel])
+  @@index([userId, status])
+  @@map("email_connections")
+}
+
+model EmailOAuthState {
+  id                       String    @id @default(uuid())
+  userId                   String
+  user                     User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  provider                 String
+  stateHash                String    @unique
+    encryptedCodeVerifier   String
+    redirectUri              String
+    accountLabel             String
+    scopes                   String[]  @default([])
+  expiresAt                DateTime
+  consumedAt               DateTime?
+  createdAt                DateTime  @default(now())
+
+  @@index([userId, expiresAt])
+  @@index([userId, consumedAt])
+  @@map("email_oauth_states")
+}
+
+model CredentialRecord {
+  id             String    @id @default(uuid())
+  userId         String
+  user           User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  name           String
+  encryptedValue String
+  version        Int       @default(1)
+  revokedAt      DateTime?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  @@unique([userId, name])
+  @@index([userId, revokedAt])
+  @@map("credential_records")
+}
+
+model RefreshTokenSession {
+  id         String    @id @default(uuid())
+  userId     String
+  user       User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash  String    @unique
+  familyId   String
+  expiresAt  DateTime
+  revokedAt  DateTime?
+  lastUsedAt DateTime?
+  createdAt  DateTime  @default(now())
+
+  @@index([userId, revokedAt])
+  @@map("refresh_token_sessions")
+}
+
 model DailyApplicationBudgetReservation {
   id            String      @id @default(uuid())
   userId        String
@@ -628,15 +761,16 @@ model ApplicationAttempt {
   applicationId String
   application   Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
 
-  attemptNumber  Int
-  status         String
-  startedAt      DateTime  @default(now())
-  completedAt    DateTime?
-  error          String?
-  fieldsDetected Int       @default(0)
-  fieldsFilled   Int       @default(0)
-  screenshot     String?
-  logs           Json      @default("[]")
+  attemptNumber        Int
+  status               String
+  startedAt            DateTime                         @default(now())
+  completedAt          DateTime?
+  error                String?
+  fieldsDetected       Int                              @default(0)
+  fieldsFilled         Int                              @default(0)
+  screenshot           String?
+  logs                 Json                             @default("[]")
+  verificationEvidence SubmissionVerificationEvidence[]
 
   @@unique([applicationId, attemptNumber])
   @@index([applicationId, startedAt])
@@ -648,12 +782,15 @@ model ApplicationDocument {
   applicationId String
   application   Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
 
-  type       String // 'resume', 'cover_letter', 'other'
-  fileName   String
-  filePath   String
-  mimeType   String
-  uploadedAt DateTime @default(now())
+  type             String // 'resume', 'cover_letter', 'other'
+  fileName         String
+  filePath         String
+  mimeType         String
+  uploadedAt       DateTime        @default(now())
+  objectMetadataId String?
+  objectMetadata   ObjectMetadata? @relation(fields: [objectMetadataId], references: [id], onDelete: Restrict)
 
+  @@unique([applicationId, objectMetadataId, type])
   @@map("application_documents")
 }
 
@@ -807,10 +944,12 @@ model Interview {
   notes             String?
   preparationStatus String    @default("NOT_STARTED")
   result            String?
+  sourceEventId     String?
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
+  @@unique([userId, sourceEventId])
   @@map("interviews")
 }
 
@@ -829,10 +968,12 @@ model Offer {
   expiresAt     DateTime?
   status        String      @default("PENDING")
   notes         String?
+  sourceEventId String?
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
+  @@unique([userId, sourceEventId])
   @@index([userId, status])
   @@index([applicationId])
   @@map("offers")
@@ -966,24 +1107,24 @@ model FailureRecord {
 }
 
 model HumanVerification {
-  id              String      @id @default(uuid())
+  id              String            @id @default(uuid())
   userId          String
-  user            User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  user            User              @relation(fields: [userId], references: [id], onDelete: Cascade)
   applicationId   String
-  application     Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+  application     Application       @relation(fields: [applicationId], references: [id], onDelete: Cascade)
   type            String
-  status          String      @default("PENDING")
+  status          String            @default("PENDING")
   prompt          String
   context         Json?
   expiresAt       DateTime
   resolvedAt      DateTime?
   resolution      Json?
-  resumeTokenHash String?     @unique
+  resumeTokenHash String?           @unique
   resumeToStatus  ApplicationStatus @default(FORM_FILLED)
   correlationId   String
   idempotencyKey  String
-  createdAt       DateTime    @default(now())
-  updatedAt       DateTime    @updatedAt
+  createdAt       DateTime          @default(now())
+  updatedAt       DateTime          @updatedAt
 
   @@unique([userId, idempotencyKey])
   @@index([userId, status, expiresAt])
@@ -1075,9 +1216,12 @@ model ApplicationAnswer {
   questionId    String
   question      ApplicationQuestion @relation(fields: [questionId], references: [id], onDelete: Cascade)
   value         Json
+  source        String
   provenance    Json
   approved      Boolean             @default(false)
   approvedAt    DateTime?
+  approvedBy    String?
+  version       Int                 @default(1)
   createdAt     DateTime            @default(now())
   updatedAt     DateTime            @updatedAt
 
@@ -1108,30 +1252,37 @@ model Embedding {
 }
 
 model ObjectMetadata {
-  id               String    @id @default(uuid())
-  userId           String
-  user             User      @relation(fields: [userId], references: [id], onDelete: Cascade)
-  bucket           String
-  objectKey        String
-  versionId        String?
-  kind             String
-  fileName         String
-  mimeType         String
-  byteSize         BigInt
-  checksumSha256   String
-  encryptionKeyRef String?
-  scanStatus       String    @default("PENDING")
-  scanDetails      Json?
-  expiresAt        DateTime?
-  deletedAt        DateTime?
-  legalHold        Boolean   @default(false)
-  provenance       Json?
-  resumeId         String?   @unique
-  resume           Resume?   @relation(fields: [resumeId], references: [id], onDelete: Cascade)
-  createdAt        DateTime  @default(now())
-  updatedAt        DateTime  @updatedAt
+  id                   String                @id @default(uuid())
+  userId               String
+  user                 User                  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  bucket               String
+  objectKey            String
+  versionId            String?
+  kind                 String
+  fileName             String
+  mimeType             String
+  byteSize             BigInt
+  checksumSha256       String
+  encryptionKeyRef     String?
+  scanStatus           String                @default("PENDING")
+  scanDetails          Json?
+  approvalStatus       String                @default("UNAPPROVED")
+  approvedAt           DateTime?
+  approvedBy           String?
+  expiresAt            DateTime?
+  deletedAt            DateTime?
+  legalHold            Boolean               @default(false)
+  provenance           Json?
+  resumeId             String?               @unique
+  resume               Resume?               @relation(fields: [resumeId], references: [id], onDelete: Cascade)
+  resumeVersionId      String?               @unique @map("resume_version_id")
+  resumeVersion        ResumeVersion?        @relation(fields: [resumeVersionId], references: [id], onDelete: Cascade)
+  applicationDocuments ApplicationDocument[]
+  createdAt            DateTime              @default(now())
+  updatedAt            DateTime              @updatedAt
 
   @@unique([bucket, objectKey, versionId])
+  @@unique([userId, kind, checksumSha256])
   @@index([userId, kind, createdAt])
   @@index([expiresAt, deletedAt])
   @@map("object_metadata")

@@ -96,7 +96,8 @@ describeDatabase.sequential('Greenhouse application persistence', () => {
     await expect(prisma.applicationAnswer.count({ where: { applicationId: verificationApplicationId } })).resolves.toBe(0);
     await expect(prisma.humanVerification.findFirstOrThrow({ where: { applicationId: verificationApplicationId } }))
       .resolves.toMatchObject({ type: 'CAPTCHA', status: 'PENDING', resolution: null });
-    await expect(prisma.applicationQuestion.findFirstOrThrow({ where: { applicationId: verificationApplicationId, externalKey: 'captcha' } }))
+    // The durable key is provider/step/semantic, not the mutable DOM id.
+    await expect(prisma.applicationQuestion.findFirstOrThrow({ where: { applicationId: verificationApplicationId } }))
       .resolves.toMatchObject({ risk: 'HUMAN_VERIFICATION_REQUIRED' });
     expect(browser.close).toHaveBeenCalledOnce();
   });

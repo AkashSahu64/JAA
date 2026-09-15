@@ -1,5 +1,5 @@
 import { JobStatus, Prisma } from '@prisma/client';
-import { prisma } from '@jobagent/database';
+import { withService } from '@jobagent/database';
 import {
   AutomationQueueWorker,
   type AutomationProcessor,
@@ -16,6 +16,8 @@ import {
   renewAutomationJobLease,
   validateAutomationJobRetry,
 } from './automation-jobs';
+import { safeErrorMessage, writeStructuredLog } from '../observability/structured-log';
+import type { StructuredLogRecord } from '../observability/structured-log';
 
 export interface AutomationJobHandlerContext {
   automationJobId: string;
@@ -33,6 +35,19 @@ export interface AutomationJobHandlerContext {
 
 export type AutomationJobHandler = (context: AutomationJobHandlerContext) => Promise<void>;
 
+function payloadIdentifier(payload: Prisma.JsonValue, key: string): string | undefined {
+  if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) return undefined;
+  const value = (payload as Record<string, Prisma.JsonValue>)[key];
+  return typeof value === 'string' && /^[A-Za-z0-9._:-]{1,128}$/.test(value) ? value : undefined;
+}
+
+function jobTraceContext(job: { payload: Prisma.JsonValue }): Pick<StructuredLogRecord, 'applicationId' | 'provider'> {
+  return {
+    applicationId: payloadIdentifier(job.payload, 'applicationId'),
+    provider: payloadIdentifier(job.payload, 'provider') ?? payloadIdentifier(job.payload, 'providerName'),
+  };
+}
+
 export interface StartAutomationWorkerOptions {
   name: QueueName;
   workerId: string;
@@ -48,7 +63,7 @@ export interface StartAutomationWorkerOptions {
 }
 
 async function loadOwnedJob(message: AutomationQueueMessage, workerId: string) {
-  return prisma.automationJob.findFirst({
+  return withService((tx) => tx.automationJob.findFirst({
     where: {
       id: message.automationJobId,
       status: JobStatus.LEASED,
@@ -56,7 +71,7 @@ async function loadOwnedJob(message: AutomationQueueMessage, workerId: string) {
       leaseOwner: workerId,
       leaseExpiresAt: { gt: new Date() },
     },
-  });
+  }));
 }
 
 function processor(options: StartAutomationWorkerOptions): AutomationProcessor {
@@ -72,19 +87,28 @@ function processor(options: StartAutomationWorkerOptions): AutomationProcessor {
     if (job.payloadVersion !== message.payloadVersion || job.deliveryGeneration !== message.deliveryGeneration || job.type !== message.type || job.correlationId !== message.correlationId) {
       throw new Error('Queue envelope does not match the authoritative AutomationJob');
     }
-    await options.handler({
-      automationJobId: job.id,
-      userId: job.userId,
-      type: job.type,
-      payload: job.payload,
-      payloadVersion: job.payloadVersion,
-      correlationId: job.correlationId,
-      deliveryGeneration: job.deliveryGeneration,
-      attempt: job.attemptCount,
-      workerId: context.workerId,
-      signal: context.signal,
-      heartbeat: context.heartbeat,
-    });
+    const startedAt = Date.now();
+    try {
+      await options.handler({
+        automationJobId: job.id,
+        userId: job.userId,
+        type: job.type,
+        payload: job.payload,
+        payloadVersion: job.payloadVersion,
+        correlationId: job.correlationId,
+        deliveryGeneration: job.deliveryGeneration,
+        attempt: job.attemptCount,
+        workerId: context.workerId,
+        signal: context.signal,
+        heartbeat: context.heartbeat,
+      });
+    } finally {
+      writeStructuredLog('info', {
+        event: 'automation.job_execution_duration', automationJobId: job.id, userId: job.userId,
+        correlationId: job.correlationId, jobType: job.type, attempt: job.attemptCount,
+        workerId: context.workerId, durationMs: Math.max(0, Date.now() - startedAt), ...jobTraceContext(job),
+      });
+    }
     return { outcome: 'EXECUTED' as const };
   };
 }
@@ -103,6 +127,22 @@ export function startAutomationWorker(options: StartAutomationWorkerOptions): Au
     onRenew: async (message) => {
       await renewAutomationJobLease({ jobId: message.automationJobId, workerId: options.workerId, leaseMs });
     },
+    onHeartbeatError: (message, error) => {
+      writeStructuredLog('error', {
+        event: 'automation.lease_renewal_failure', automationJobId: message.automationJobId,
+        correlationId: message.correlationId, jobType: message.type,
+        errorName: error.name, errorMessage: safeErrorMessage(error), workerId: options.workerId,
+      });
+    },
+    onWorkerError: (error) => {
+      writeStructuredLog('error', {
+        event: 'automation.worker_error',
+        errorName: error.name,
+        errorMessage: safeErrorMessage(error),
+        workerId: options.workerId,
+        queue: options.name,
+      });
+    },
     isLeaseLost: (error) => error instanceof AutomationJobError && error.code === 'LEASE_LOST',
     onComplete: async (message, result) => {
       if (result && result.outcome === 'SKIPPED') return;
@@ -110,10 +150,10 @@ export function startAutomationWorker(options: StartAutomationWorkerOptions): Au
       if (job) await completeAutomationJob({ jobId: message.automationJobId, workerId: options.workerId });
     },
     shouldRetry: async (message) => {
-      const job = await prisma.automationJob.findUnique({
+      const job = await withService((tx) => tx.automationJob.findUnique({
         where: { id: message.automationJobId },
         select: { status: true },
-      });
+      }));
       return job?.status === JobStatus.AVAILABLE;
     },
     onRetry: async (message, { nextDispatchAttempt, deliveryGeneration }) => {
@@ -125,12 +165,20 @@ export function startAutomationWorker(options: StartAutomationWorkerOptions): Au
       });
     },
     onFailure: async (message, error, retryDelayMs) => {
+      const failure = error instanceof Error ? error : new Error('Unknown automation failure');
       const job = await loadOwnedJob(message, options.workerId);
+      writeStructuredLog('error', {
+        event: 'automation.job_failure', automationJobId: message.automationJobId,
+        correlationId: message.correlationId, jobType: message.type,
+        attempt: message.dispatchAttempt, errorName: failure.name,
+        errorMessage: safeErrorMessage(failure), retryDelayMs, workerId: options.workerId,
+        ...(job ? jobTraceContext(job) : {}),
+      });
       if (!job) return 'IGNORED';
       const updated = await failAutomationJob({
         jobId: message.automationJobId,
         workerId: options.workerId,
-        error: error.message,
+        error: safeErrorMessage(failure),
         retryDelayMs,
         providerRetryAfterMs: error instanceof AutomationJobRetryError ? error.retryAfterMs : undefined,
       });

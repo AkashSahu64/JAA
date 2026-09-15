@@ -15,9 +15,11 @@ describeDatabase.sequential('human verification transaction', () => {
   const userId = randomUUID();
   const otherUserId = randomUUID();
   const jobId = randomUUID();
+  const submissionJobId = randomUUID();
   const resumeId = randomUUID();
   const resumeVersionId = randomUUID();
   const applicationId = randomUUID();
+  const submissionApplicationId = randomUUID();
 
   const request = (overrides: Partial<Parameters<typeof requestHumanVerification>[0]> = {}) => requestHumanVerification({
     userId,
@@ -39,16 +41,23 @@ describeDatabase.sequential('human verification transaction', () => {
       id: jobId, source: 'fixture', company: 'Example', title: 'Engineer', description: 'fixture',
       applicationUrl: 'https://example.invalid/apply', sourceUrl: 'https://example.invalid/job',
     } });
+    await prisma.job.create({ data: {
+      id: submissionJobId, source: 'fixture', company: 'Example', title: 'Submission Engineer', description: 'fixture',
+      applicationUrl: 'https://example.invalid/apply-submission', sourceUrl: 'https://example.invalid/job-submission',
+    } });
     await prisma.resume.create({ data: { id: resumeId, userId, name: 'Fixture resume', content: 'Approved fixture facts only.' } });
     await prisma.resumeVersion.create({ data: { id: resumeVersionId, resumeId, content: 'Approved fixture facts only.' } });
     await prisma.application.create({ data: {
       id: applicationId, userId, jobId, resumeVersionId, status: 'APPLICATION_STARTED',
     } });
+    await prisma.application.create({ data: {
+      id: submissionApplicationId, userId, jobId: submissionJobId, resumeVersionId, status: 'SUBMISSION_PENDING',
+    } });
   });
 
   afterAll(async () => {
     await prisma.user.deleteMany({ where: { id: { in: [userId, otherUserId] } } });
-    await prisma.job.deleteMany({ where: { id: jobId } });
+    await prisma.job.deleteMany({ where: { id: { in: [jobId, submissionJobId] } } });
     await prisma.$disconnect();
   });
 
@@ -93,6 +102,16 @@ describeDatabase.sequential('human verification transaction', () => {
       where: { id: created.verification.id },
       data: { status: 'EXPIRED', resolvedAt: new Date(), resolution: { testCleanup: true, credentialMaterialStored: false } },
     });
+  });
+
+  it('pauses a submission checkpoint and resumes to explicit re-authorization readiness', async () => {
+    const created = await request({ applicationId: submissionApplicationId, idempotencyKey: randomUUID(), correlationId: randomUUID() });
+    await expect(prisma.application.findUniqueOrThrow({ where: { id: submissionApplicationId } }))
+      .resolves.toMatchObject({ status: 'WAITING_FOR_USER', version: 2 });
+    await resolveHumanVerification({ userId, verificationId: created.verification.id, correlationId: created.verification.correlationId });
+    await resumeHumanVerification(userId, created.verification.id, created.verification.correlationId);
+    await expect(prisma.application.findUniqueOrThrow({ where: { id: submissionApplicationId } }))
+      .resolves.toMatchObject({ status: 'READY_TO_SUBMIT', version: 3 });
   });
 
   it('expires an acknowledgement whose expiry passes before resolution', async () => {

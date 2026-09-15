@@ -1,21 +1,46 @@
 import {
-  GreenhouseApplicationAdapter,
-  type ApprovedGreenhouseProfile,
-  type GreenhouseField,
-  type GreenhouseFillResult,
-  type GreenhouseFormPort,
-  type GreenhouseFormSnapshot,
-} from './greenhouse';
+  ApplicationFormAdapter,
+  normalizeApplicationFormSnapshot,
+  type ApplicationFormField,
+  type ApplicationFormFillResult,
+  type FormDetector,
+  type ApplicationFormPort,
+  type ApplicationFormProfileKey,
+  type ApplicationFormSnapshot,
+} from '../form-intelligence';
+import { safeProviderApplicationHost } from './provider-host';
 
-/** Lever uses the same fail-closed generic form contract as Greenhouse. */
-export type LeverField = GreenhouseField;
-export type LeverFormSnapshot = GreenhouseFormSnapshot;
-export type ApprovedLeverProfile = ApprovedGreenhouseProfile;
-export type LeverFormPort = GreenhouseFormPort;
-export type LeverFillResult = GreenhouseFillResult;
+export type LeverField = ApplicationFormField;
 
-/**
- * Provider boundary for Lever forms. It intentionally inherits only generic,
- * policy-controlled field handling: it never submits, uploads, or invents answers.
- */
-export class LeverApplicationAdapter extends GreenhouseApplicationAdapter {}
+export interface LeverFormSnapshot extends ApplicationFormSnapshot {
+  provider?: ApplicationFormSnapshot['provider'];
+  stepIdentity?: string;
+  fields: readonly LeverField[];
+}
+
+export type ApprovedLeverProfile = Readonly<Partial<Record<ApplicationFormProfileKey, string>>>;
+export type LeverFormPort = ApplicationFormPort<LeverFormSnapshot>;
+export type LeverFillResult = ApplicationFormFillResult;
+
+export function leverApplicationHost(url: string): string | null {
+  return safeProviderApplicationHost(url, ['jobs.lever.co']);
+}
+
+const leverDetector: FormDetector<LeverFormPort> = {
+  detect: async port => {
+    const raw = await port.snapshot();
+    const hasProvider = Boolean(raw && typeof raw === 'object' && !Array.isArray(raw) && Object.prototype.hasOwnProperty.call(raw, 'provider'));
+    if (hasProvider && (raw as ApplicationFormSnapshot).provider !== 'LEVER') {
+      return { provider: 'UNKNOWN', step: 0, stepIdentity: 'default', fields: [], hasNextStep: false, validationErrors: [] };
+    }
+    const snapshot = normalizeApplicationFormSnapshot(raw);
+    return snapshot.provider === 'UNKNOWN' ? { ...snapshot, provider: 'LEVER' } : snapshot;
+  },
+};
+
+/** Lever provider boundary; this owns only Lever transport while generic policy remains shared. */
+export class LeverApplicationAdapter extends ApplicationFormAdapter<LeverFormPort> {
+  constructor() {
+    super(leverDetector);
+  }
+}

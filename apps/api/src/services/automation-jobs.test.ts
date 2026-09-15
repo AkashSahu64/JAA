@@ -3,6 +3,7 @@ import {
   AutomationJobError,
   AutomationJobRetryError,
   effectiveAutomationJobRetryDelayMs,
+  validateAutomationJobNow,
 } from './automation-jobs';
 
 describe('automation job errors', () => {
@@ -31,5 +32,9 @@ describe('automation job errors', () => {
 
   it('rejects invalid local retry delay values', () => {
     expect(() => effectiveAutomationJobRetryDelayMs(0, 15_000)).toThrow('retryDelayMs must be a positive integer');
+  });
+
+  it('rejects invalid recovery timestamps before database work', () => {
+    expect(() => validateAutomationJobNow(new Date(Number.NaN))).toThrow('now must be a valid Date');
   });
 });

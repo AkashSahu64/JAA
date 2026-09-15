@@ -1,5 +1,6 @@
 import { Prisma, JobStatus, type AutomationJob } from '@prisma/client';
-import { prisma, withTenant } from '@jobagent/database';
+import { withService, withTenant } from '@jobagent/database';
+import { safeErrorMessage } from '../observability/structured-log';
 
 export interface CreateAutomationJobInput {
   userId: string;
@@ -82,6 +83,11 @@ function positiveInteger(value: number, name: string): void {
   if (!Number.isSafeInteger(value) || value <= 0) throw new AutomationJobError('INVALID_INPUT', `${name} must be a positive integer`);
 }
 
+export function validateAutomationJobNow(value: Date): Date {
+  if (!(value instanceof Date) || !Number.isFinite(value.getTime())) throw new AutomationJobError('INVALID_INPUT', 'now must be a valid Date');
+  return value;
+}
+
 function payloadEquals(left: Prisma.JsonValue, right: Prisma.InputJsonValue): boolean {
   return JSON.stringify(left) === JSON.stringify(right);
 }
@@ -155,7 +161,7 @@ export async function validateAutomationJobRetry(input: ValidateAutomationJobRet
   if (input.nextDispatchAttempt !== input.expectedAttempt + 1) {
     throw new AutomationJobError('INVALID_INPUT', 'nextDispatchAttempt must immediately follow expectedAttempt');
   }
-  await prisma.$transaction(async (tx) => {
+  await withService(async (tx) => {
     const [job] = await tx.$queryRaw<Array<{
       status: JobStatus;
       deliveryGeneration: number;
@@ -188,10 +194,10 @@ export async function claimAutomationJobs(input: ClaimAutomationJobsInput): Prom
   const leaseMs = input.leaseMs ?? 30_000;
   positiveInteger(limit, 'limit');
   positiveInteger(leaseMs, 'leaseMs');
-  const now = input.now ?? new Date();
+  const now = validateAutomationJobNow(input.now ?? new Date());
   const leaseExpiresAt = new Date(now.getTime() + leaseMs);
 
-  return prisma.$transaction(async (tx) => {
+  return withService(async (tx) => {
     await tx.$executeRaw`
       UPDATE automation_jobs
       SET status = 'DEAD_LETTER'::"JobStatus",
@@ -238,8 +244,8 @@ export async function claimAutomationJobs(input: ClaimAutomationJobsInput): Prom
 }
 
 async function getOwnedJob(input: OwnedAutomationJobInput): Promise<AutomationJob> {
-  const now = input.now ?? new Date();
-  const job = await prisma.automationJob.findUnique({ where: { id: input.jobId } });
+  const now = validateAutomationJobNow(input.now ?? new Date());
+  const job = await withService((tx) => tx.automationJob.findUnique({ where: { id: input.jobId } }));
   if (!job) throw new AutomationJobError('NOT_FOUND', 'Automation job not found');
   if (job.status !== JobStatus.LEASED || job.leaseOwner !== input.workerId || !job.leaseExpiresAt || job.leaseExpiresAt <= now) {
     throw new AutomationJobError('LEASE_LOST', 'Automation job lease is absent, expired, or owned by another worker');
@@ -254,9 +260,9 @@ export async function leaseAutomationJob(input: LeaseAutomationJobInput): Promis
   positiveInteger(leaseMs, 'leaseMs');
   if (input.expectedAttempt !== undefined) positiveInteger(input.expectedAttempt, 'expectedAttempt');
   if (input.deliveryGeneration !== undefined) positiveInteger(input.deliveryGeneration, 'deliveryGeneration');
-  const now = input.now ?? new Date();
+  const now = validateAutomationJobNow(input.now ?? new Date());
   const leaseExpiresAt = new Date(now.getTime() + leaseMs);
-  return prisma.$transaction(async (tx) => {
+  return withService(async (tx) => {
     const leased = await tx.$queryRaw<AutomationJob[]>`
       UPDATE automation_jobs
       SET status = 'LEASED'::"JobStatus",
@@ -289,26 +295,26 @@ export async function renewAutomationJobLease(input: OwnedAutomationJobInput & {
   requireText(input.workerId, 'workerId');
   const leaseMs = input.leaseMs ?? 30_000;
   positiveInteger(leaseMs, 'leaseMs');
-  const now = input.now ?? new Date();
+  const now = validateAutomationJobNow(input.now ?? new Date());
   await getOwnedJob({ ...input, now });
-  const updated = await prisma.automationJob.updateMany({
+  const updated = await withService((tx) => tx.automationJob.updateMany({
     where: { id: input.jobId, status: JobStatus.LEASED, leaseOwner: input.workerId, leaseExpiresAt: { gt: now } },
     data: { leaseExpiresAt: new Date(now.getTime() + leaseMs) },
-  });
+  }));
   if (updated.count !== 1) throw new AutomationJobError('LEASE_LOST', 'Automation job lease changed concurrently');
-  return prisma.automationJob.findUniqueOrThrow({ where: { id: input.jobId } });
+  return withService((tx) => tx.automationJob.findUniqueOrThrow({ where: { id: input.jobId } }));
 }
 
 export async function completeAutomationJob(input: OwnedAutomationJobInput): Promise<AutomationJob> {
   requireText(input.workerId, 'workerId');
-  const now = input.now ?? new Date();
+  const now = validateAutomationJobNow(input.now ?? new Date());
   await getOwnedJob({ ...input, now });
-  const updated = await prisma.automationJob.updateMany({
+  const updated = await withService((tx) => tx.automationJob.updateMany({
     where: { id: input.jobId, status: JobStatus.LEASED, leaseOwner: input.workerId, leaseExpiresAt: { gt: now } },
     data: { status: JobStatus.SUCCEEDED, completedAt: now, leaseOwner: null, leaseExpiresAt: null, lastError: null },
-  });
+  }));
   if (updated.count !== 1) throw new AutomationJobError('LEASE_LOST', 'Automation job lease changed concurrently');
-  return prisma.automationJob.findUniqueOrThrow({ where: { id: input.jobId } });
+  return withService((tx) => tx.automationJob.findUniqueOrThrow({ where: { id: input.jobId } }));
 }
 
 export async function failAutomationJob(
@@ -317,25 +323,29 @@ export async function failAutomationJob(
   requireText(input.workerId, 'workerId');
   requireText(input.error, 'error');
   const retryDelayMs = effectiveAutomationJobRetryDelayMs(input.retryDelayMs ?? 1_000, input.providerRetryAfterMs);
-  const now = input.now ?? new Date();
+  const now = validateAutomationJobNow(input.now ?? new Date());
   const job = await getOwnedJob({ ...input, now });
   const exhausted = job.attemptCount >= job.maxAttempts;
-  const updated = await prisma.automationJob.updateMany({
+  const updated = await withService((tx) => tx.automationJob.updateMany({
     where: { id: input.jobId, status: JobStatus.LEASED, leaseOwner: input.workerId, leaseExpiresAt: { gt: now } },
     data: {
       status: exhausted ? JobStatus.DEAD_LETTER : JobStatus.AVAILABLE,
       leaseOwner: null,
       leaseExpiresAt: null,
-      lastError: input.error.slice(0, 10_000),
+      lastError: safeErrorMessage(input.error),
       ...(exhausted ? { completedAt: now } : { availableAt: new Date(now.getTime() + retryDelayMs) }),
     },
-  });
+  }));
   if (updated.count !== 1) throw new AutomationJobError('LEASE_LOST', 'Automation job lease changed concurrently');
-  return prisma.automationJob.findUniqueOrThrow({ where: { id: input.jobId } });
+  return withService((tx) => tx.automationJob.findUniqueOrThrow({ where: { id: input.jobId } }));
 }
 
 export async function reconcileExpiredAutomationJobLeases(now = new Date()): Promise<{ available: number; deadLetter: number }> {
-  return prisma.$transaction(async (tx) => {
+  validateAutomationJobNow(now);
+  // This is a worker-wide maintenance operation. The application Prisma client
+  // runs under tenant RLS, which would otherwise make recovery incomplete or
+  // silently skip another tenant's expired lease.
+  return withService(async (tx) => {
     const deadLetter = await tx.$executeRaw`
       UPDATE automation_jobs
       SET status = 'DEAD_LETTER'::"JobStatus",
@@ -421,6 +431,7 @@ export async function replayDeadLetterAutomationJob(input: ReplayAutomationJobIn
 export async function cancelAutomationJob(jobId: string, userId: string, now = new Date()): Promise<AutomationJob> {
   requireText(jobId, 'jobId');
   requireText(userId, 'userId');
+  validateAutomationJobNow(now);
   return withTenant(userId, async (tx) => {
     const current = await tx.automationJob.findFirst({ where: { id: jobId, userId } });
     if (!current) throw new AutomationJobError('NOT_FOUND', 'Automation job not found');

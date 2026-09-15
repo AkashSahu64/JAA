@@ -13,10 +13,11 @@ const transitions: Record<ApplicationStatus, readonly ApplicationStatus[]> = {
   FORM_FILLED: ['WAITING_FOR_USER', 'READY_TO_SUBMIT', 'RETRY_PENDING', 'FAILED', 'WITHDRAWN'],
   WAITING_FOR_USER: ['FORM_FILLED', 'READY_TO_SUBMIT', 'FAILED', 'WITHDRAWN'],
   READY_TO_SUBMIT: ['SUBMISSION_PENDING', 'WAITING_FOR_USER', 'FAILED', 'WITHDRAWN'],
-  SUBMISSION_PENDING: ['UNCONFIRMED', 'RETRY_PENDING', 'FAILED'],
+  SUBMISSION_PENDING: ['WAITING_FOR_USER', 'UNCONFIRMED', 'RETRY_PENDING', 'FAILED'],
   SUBMITTED: ['UNCONFIRMED'],
   UNCONFIRMED: ['CONFIRMED', 'RETRY_PENDING', 'FAILED'],
-  CONFIRMED: ['INTERVIEW', 'REJECTED', 'OFFER', 'WITHDRAWN'],
+  CONFIRMED: ['ASSESSMENT', 'INTERVIEW', 'REJECTED', 'OFFER', 'WITHDRAWN'],
+  ASSESSMENT: ['INTERVIEW', 'OFFER', 'REJECTED', 'WITHDRAWN'],
   FAILED: ['RETRY_PENDING', 'WITHDRAWN'],
   RETRY_PENDING: ['QUEUED', 'APPLICATION_STARTED', 'FAILED', 'WITHDRAWN'],
   INTERVIEW: ['INTERVIEW', 'OFFER', 'REJECTED', 'WITHDRAWN'],
@@ -39,6 +40,8 @@ export interface TransitionApplicationInput {
   idempotencyKey: string;
   correlationId: string;
   metadata?: Prisma.InputJsonObject;
+  /** Source event time when a transition represents an externally observed action. */
+  effectiveAt?: Date;
 }
 
 export class ApplicationTransitionError extends Error {
@@ -66,6 +69,9 @@ function validateInput(input: TransitionApplicationInput): void {
   if (!input.reason.trim()) throw new ApplicationTransitionError('INVALID_TRANSITION', 'A transition reason is required');
   if (!input.idempotencyKey.trim()) throw new ApplicationTransitionError('IDEMPOTENCY_CONFLICT', 'An idempotency key is required');
   if (!input.correlationId.trim()) throw new ApplicationTransitionError('INVALID_TRANSITION', 'A correlation ID is required');
+  if (input.effectiveAt !== undefined && (!(input.effectiveAt instanceof Date) || !Number.isFinite(input.effectiveAt.getTime()))) {
+    throw new ApplicationTransitionError('INVALID_TRANSITION', 'The transition effective time is invalid');
+  }
   if (input.toStatus === 'CONFIRMED' && input.actorType !== 'VERIFIER') {
     throw new ApplicationTransitionError('VERIFICATION_REQUIRED', 'CONFIRMED requires the independent verifier');
   }
@@ -101,7 +107,7 @@ export async function transitionApplicationInTenant(tx: TenantTransaction, input
   if (!canTransition(current.status, input.toStatus)) {
     throw new ApplicationTransitionError('INVALID_TRANSITION', `Cannot transition from ${current.status} to ${input.toStatus}`);
   }
-  const now = new Date();
+  const now = input.effectiveAt ?? new Date();
   const changed = await tx.application.updateMany({
     where: { id: current.id, userId: input.userId, status: current.status, version: input.expectedVersion },
     data: {

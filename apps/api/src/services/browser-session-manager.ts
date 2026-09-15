@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { lookup } from 'node:dns/promises';
-import { BrowserNavigationPolicy, BrowserNavigationPolicyError, classifyBlockedIpLiteral } from '@jobagent/security';
-import { withTenant } from '@jobagent/database';
+import { BrowserNavigationPolicy, BrowserNavigationPolicyError } from '@jobagent/security';
+import { withService, withTenant } from '@jobagent/database';
 import { chromium, type Browser, type BrowserContext, type Page } from 'playwright';
 
 const activeStatus = 'ACTIVE';
@@ -18,7 +18,7 @@ type LiveSession = {
   expiresAt: Date;
 };
 
-type SessionCloseReason = 'STARTUP_FAILED' | 'SHUTDOWN';
+type SessionCloseReason = 'STARTUP_FAILED' | 'SHUTDOWN' | 'RECOVERY';
 
 export class BrowserSessionError extends Error {
   constructor(public readonly code: 'INVALID' | 'NOT_FOUND' | 'EXPIRED' | 'POLICY_DENIED', message: string) {
@@ -38,27 +38,52 @@ export interface StartBrowserSessionInput {
   expiresAt: Date;
 }
 
+/** Recover durable ACTIVE references left behind by a worker or browser crash. */
+export async function reconcileStaleBrowserSessions(now = new Date(), staleAfterMs = 15 * 60 * 1000): Promise<number> {
+  if (!(now instanceof Date) || !Number.isFinite(now.getTime())) throw new BrowserSessionError('INVALID', 'Browser session recovery time is invalid');
+  if (!Number.isSafeInteger(staleAfterMs) || staleAfterMs < 60_000) throw new BrowserSessionError('INVALID', 'Browser session stale window must be at least one minute');
+  const before = new Date(now.getTime() - staleAfterMs);
+  const candidates = await withService(tx => tx.browserSessionReference.findMany({
+    where: { status: activeStatus, OR: [{ expiresAt: { lte: now } }, { createdAt: { lte: before } }] },
+    select: { id: true, userId: true, externalRef: true, correlationId: true, expiresAt: true },
+  }));
+  let recovered = 0;
+  for (const candidate of candidates) {
+    recovered += await withTenant(candidate.userId, async tx => {
+      const status = candidate.expiresAt <= now ? expiredStatus : closedStatus;
+      const updated = await tx.browserSessionReference.updateMany({ where: { id: candidate.id, userId: candidate.userId, status: activeStatus }, data: { status, closedAt: now } });
+      if (!updated.count) return 0;
+      await Promise.all([
+        tx.auditLog.create({ data: { userId: candidate.userId, action: 'BROWSER_SESSION_RECOVERED', resource: 'BrowserSessionReference', resourceId: candidate.id, details: { externalRef: candidate.externalRef, status, reason: 'RECOVERY', recoveredAt: now.toISOString() } } }),
+        tx.outboxEvent.create({ data: { userId: candidate.userId, aggregateType: 'BrowserSessionReference', aggregateId: candidate.id, eventType: 'browser-session.recovered', payload: { status, reason: 'RECOVERY', recoveredAt: now.toISOString() }, schemaVersion: 1, correlationId: candidate.correlationId, idempotencyKey: `browser-session-recovered:${candidate.id}` } }),
+      ]);
+      return 1;
+    });
+  }
+  return recovered;
+}
+
 function requireText(value: string, name: string): void {
-  if (!value.trim()) throw new BrowserSessionError('INVALID', `${name} is required`);
+  if (typeof value !== 'string' || !value.trim()) throw new BrowserSessionError('INVALID', `${name} is required`);
 }
 
 function validExpiry(expiresAt: Date, now: Date): boolean {
-  return Number.isFinite(expiresAt.getTime()) && expiresAt > now
+  return expiresAt instanceof Date && Number.isFinite(expiresAt.getTime()) && expiresAt > now
     && expiresAt.getTime() - now.getTime() <= maxSessionLifetimeMs;
 }
 
-function policyFor(allowedHosts: readonly string[]): BrowserNavigationPolicy {
-  if (!allowedHosts.length) throw new BrowserSessionError('INVALID', 'At least one allowed host is required');
+function policyFor(allowedHosts: readonly string[], resolveHostname: ResolveBrowserHost): BrowserNavigationPolicy {
+  if (!Array.isArray(allowedHosts) || !allowedHosts.length) throw new BrowserSessionError('INVALID', 'At least one allowed host is required');
   try {
-    return new BrowserNavigationPolicy({ allowedHosts });
+    return new BrowserNavigationPolicy({ allowedHosts, resolveHostname });
   } catch (error) {
     throw new BrowserSessionError('INVALID', error instanceof Error ? error.message : 'Allowed hosts are invalid');
   }
 }
 
-function assertAllowed(policy: BrowserNavigationPolicy, target: string): URL {
+async function assertAllowed(policy: BrowserNavigationPolicy, target: string): Promise<URL> {
   try {
-    return policy.assertAllowed(target);
+    return await policy.assertResolvedAllowed(target);
   } catch (error) {
     if (error instanceof BrowserNavigationPolicyError) {
       throw new BrowserSessionError('POLICY_DENIED', error.message);
@@ -72,21 +97,6 @@ type ResolveBrowserHost = (hostname: string) => Promise<readonly string[]>;
 async function resolveBrowserHost(hostname: string): Promise<readonly string[]> {
   const addresses = await lookup(hostname, { all: true, verbatim: true });
   return addresses.map(address => address.address);
-}
-
-async function assertDnsSafe(target: URL, resolveHost: ResolveBrowserHost): Promise<void> {
-  let addresses: readonly string[];
-  try {
-    addresses = await resolveHost(target.hostname);
-  } catch {
-    throw new BrowserSessionError(
-      'POLICY_DENIED',
-      'Browser navigation hostname could not be resolved safely',
-    );
-  }
-  if (!addresses.length || addresses.some(address => classifyBlockedIpLiteral(address))) {
-    throw new BrowserSessionError('POLICY_DENIED', 'Browser navigation resolved to a blocked network address');
-  }
 }
 
 export class BrowserSessionManager {
@@ -106,9 +116,8 @@ export class BrowserSessionManager {
     requireText(input.idempotencyKey, 'idempotencyKey');
     const now = new Date();
     if (!validExpiry(input.expiresAt, now)) throw new BrowserSessionError('INVALID', 'Session expiry must be within the next hour');
-    const policy = policyFor(input.allowedHosts);
-    const target = assertAllowed(policy, input.targetUrl);
-    await assertDnsSafe(target, this.resolveHost);
+    const policy = policyFor(input.allowedHosts, this.resolveHost);
+    const target = await assertAllowed(policy, input.targetUrl);
     const externalRef = `browser-session:${randomUUID()}`;
 
     const persisted = await withTenant(input.userId, async tx => {
@@ -169,8 +178,7 @@ export class BrowserSessionManager {
       await this.close(session.userId, externalRef, session.correlationId, expiredStatus);
       throw new BrowserSessionError('EXPIRED', 'Browser session has expired');
     }
-    const target = assertAllowed(session.policy, targetUrl);
-    await assertDnsSafe(target, this.resolveHost);
+    const target = await assertAllowed(session.policy, targetUrl);
     await session.page.goto(target.href, {
       waitUntil: 'domcontentloaded',
       timeout: this.navigationTimeout(session.expiresAt),
@@ -258,17 +266,8 @@ export class BrowserSessionManager {
   private async installNavigationGuard(page: Page, policy: BrowserNavigationPolicy): Promise<void> {
     await page.route('**/*', async route => {
       const request = route.request();
-      const decision = policy.evaluate(request.url());
+      const decision = await policy.evaluateResolved(request.url());
       if (!decision.allowed) return route.abort('blockedbyclient');
-
-      // Every browser-originated request, including redirects and subresources, is
-      // re-authorized and re-resolved. This prevents a hostile page from using an
-      // allowlisted hostname that resolves to a private address after startup.
-      try {
-        await assertDnsSafe(new URL(decision.normalizedUrl!), this.resolveHost);
-      } catch {
-        return route.abort('blockedbyclient');
-      }
       return route.continue();
     });
   }

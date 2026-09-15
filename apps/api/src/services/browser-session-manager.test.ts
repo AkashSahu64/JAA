@@ -125,6 +125,15 @@ describe('BrowserSessionManager', () => {
     expect(route.continue).not.toHaveBeenCalled();
   });
 
+  it('fails closed on malformed runtime session inputs', async () => {
+    const fake = fakeBrowser();
+    const manager = new BrowserSessionManager(async () => fake.browser as never, async () => ['93.184.216.34']);
+    await expect(manager.start(input({ targetUrl: 123 as never }))).rejects.toMatchObject({ code: 'INVALID' } satisfies Partial<BrowserSessionError>);
+    await expect(manager.start(input({ expiresAt: 'tomorrow' as never }))).rejects.toMatchObject({ code: 'INVALID' } satisfies Partial<BrowserSessionError>);
+    await expect(manager.start(input({ allowedHosts: 'careers.example.com' as never }))).rejects.toMatchObject({ code: 'INVALID' } satisfies Partial<BrowserSessionError>);
+    expect(fake.browser.newContext).not.toHaveBeenCalled();
+  });
+
 
   it('revalidates DNS before explicit navigation and closes startup failures', async () => {
     database.reset();

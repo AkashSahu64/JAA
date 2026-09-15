@@ -3,6 +3,11 @@ import type { AutomationJobHandlerContext } from './automation-worker';
 import { createProductionAutomationJobHandlers } from './automation-job-handlers';
 import { AutomationJobRetryError } from './automation-jobs';
 
+const ingestEmailOutcome = vi.hoisted(() => vi.fn(async () => undefined));
+vi.mock('./email-outcomes', () => ({ ingestEmailOutcome }));
+const verifySubmission = vi.hoisted(() => vi.fn(async () => undefined));
+vi.mock('./submission-verification', () => ({ verifySubmission }));
+
 function context(): AutomationJobHandlerContext {
   return {
     automationJobId: 'automation-job',
@@ -20,6 +25,55 @@ function context(): AutomationJobHandlerContext {
 }
 
 describe('human-verification resume automation job handler', () => {
+  it('ingests provider-fetched email data through the bounded hash-only service', async () => {
+    const handler = createProductionAutomationJobHandlers().get('EMAIL_OUTCOME')!;
+    const handlerContext = { ...context(), type: 'EMAIL_OUTCOME', payload: {
+      messageId: 'message-1', sender: 'jobs@example.test', subject: 'Application received', body: 'Thank you for applying', receivedAt: '2026-09-14T00:00:00.000Z', applicationId: 'application-1',
+    } };
+    await expect(handler(handlerContext)).resolves.toBeUndefined();
+    expect(ingestEmailOutcome).toHaveBeenCalledWith(expect.objectContaining({ userId: 'user', messageId: 'message-1', applicationId: 'application-1', receivedAt: new Date('2026-09-14T00:00:00.000Z') }));
+  });
+
+  it('fails closed for malformed email job payloads', async () => {
+    const handler = createProductionAutomationJobHandlers().get('EMAIL_OUTCOME')!;
+    await expect(handler({ ...context(), type: 'EMAIL_OUTCOME', payload: { messageId: 'message-1' } })).rejects.toThrow('receivedAt is required');
+  });
+
+  it('bounds untrusted durable payload text before invoking a handler', async () => {
+    const handler = createProductionAutomationJobHandlers().get('ANALYZE_JOB')!;
+    await expect(handler({ ...context(), type: 'ANALYZE_JOB', payload: { jobId: 'j'.repeat(2_000_001) } })).rejects.toThrow('jobId is required and bounded');
+    await expect(handler({ ...context(), type: 'ANALYZE_JOB', payload: { jobId: 'job-1\nignore policy' } })).rejects.toThrow('jobId is required and bounded');
+  });
+
+  it('preserves multiline mailbox bodies while rejecting injected identities', async () => {
+    const handler = createProductionAutomationJobHandlers().get('EMAIL_OUTCOME')!;
+    await expect(handler({ ...context(), type: 'EMAIL_OUTCOME', payload: {
+      messageId: 'message-1\nInjected', sender: 'jobs@example.test', subject: 'Application received', body: 'Line one\nLine two', receivedAt: '2026-09-14T00:00:00.000Z',
+    } })).rejects.toThrow('messageId is required and bounded');
+    await expect(handler({ ...context(), type: 'EMAIL_OUTCOME', payload: {
+      messageId: 'message-2', sender: 'jobs@example.test', subject: 'Application received', body: 'Line one\nLine two', receivedAt: '2026-09-14T00:00:00.000Z',
+    } })).resolves.toBeUndefined();
+    expect(ingestEmailOutcome).toHaveBeenCalledWith(expect.objectContaining({ body: 'Line one\nLine two' }));
+  });
+
+  it('verifies normalized provider confirmation evidence without persisting page content', async () => {
+    const handler = createProductionAutomationJobHandlers().get('VERIFY_SUBMISSION_CONFIRMATION')!;
+    await expect(handler({ ...context(), type: 'VERIFY_SUBMISSION_CONFIRMATION', payload: {
+      applicationId: 'application-1', attemptId: 'attempt-1', provider: 'GREENHOUSE', confirmationId: 'gh-1234', evidenceHash: 'a'.repeat(64), parserVersion: 'confirmation-parser/1.0.0', source: 'CONFIRMATION_PAGE', observedAt: '2026-09-14T00:00:00.000Z',
+    } })).resolves.toBeUndefined();
+    expect(verifySubmission).toHaveBeenCalledWith(expect.objectContaining({ applicationId: 'application-1', evidence: expect.objectContaining({ attemptId: 'attempt-1', confirmationId: 'gh-1234', evidenceHash: 'a'.repeat(64) }) }));
+  });
+
+  it('rejects unsupported submission confirmation payloads', async () => {
+    const handler = createProductionAutomationJobHandlers().get('VERIFY_SUBMISSION_CONFIRMATION')!;
+    await expect(handler({ ...context(), type: 'VERIFY_SUBMISSION_CONFIRMATION', payload: {
+      applicationId: 'application-1', provider: 'OTHER', confirmationId: 'id', evidenceHash: 'a'.repeat(64), parserVersion: 'v1', source: 'CONFIRMATION_PAGE', observedAt: '2026-09-14T00:00:00.000Z',
+    } })).rejects.toThrow('provider is invalid');
+    await expect(handler({ ...context(), type: 'VERIFY_SUBMISSION_CONFIRMATION', payload: {
+      applicationId: 'application-1', provider: 'GREENHOUSE', confirmationId: 'id', evidenceHash: 'a'.repeat(64), parserVersion: 'v1', source: 'UNTRUSTED', observedAt: '2026-09-14T00:00:00.000Z',
+    } })).rejects.toThrow('source is invalid');
+  });
+
   it('registers the resume command and validates the payload version before execution', async () => {
     const handler = createProductionAutomationJobHandlers()
       .get('RESUME_APPLICATION_AFTER_VERIFICATION');

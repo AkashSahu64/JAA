@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { prisma } from '@jobagent/database';
-import { BrowserSessionError, BrowserSessionManager } from './browser-session-manager';
+import { BrowserSessionError, BrowserSessionManager, reconcileStaleBrowserSessions } from './browser-session-manager';
 
 const enabled = process.env.DATABASE_INTEGRATION === '1' && Boolean(process.env.DATABASE_URL);
 const describeDatabase = enabled ? describe : describe.skip;
@@ -118,5 +118,19 @@ describeDatabase.sequential('browser session persistence', () => {
       idempotencyKey: randomUUID(),
       correlationId: randomUUID(),
     }))).rejects.toMatchObject({ code: 'NOT_FOUND' } satisfies Partial<BrowserSessionError>);
+  });
+
+  it('recovers an expired durable session left active after a worker crash', async () => {
+    const now = new Date('2026-09-15T00:00:00.000Z');
+    const stale = await prisma.browserSessionReference.create({ data: {
+      userId, applicationId, workerId: 'crashed-worker', externalRef: `browser-session:stale-${randomUUID()}`,
+      status: 'ACTIVE', allowedHost: 'careers.example.com', initialUrl: 'https://careers.example.com/apply',
+      correlationId: 'browser-recovery', idempotencyKey: `browser-recovery-${randomUUID()}`,
+      expiresAt: new Date('2026-09-14T23:59:00.000Z'), createdAt: new Date('2026-09-14T23:00:00.000Z'),
+    } });
+    await expect(reconcileStaleBrowserSessions(now, 60_000)).resolves.toBeGreaterThanOrEqual(1);
+    await expect(prisma.browserSessionReference.findUniqueOrThrow({ where: { id: stale.id } })).resolves.toMatchObject({ status: 'EXPIRED', closedAt: now });
+    await expect(prisma.auditLog.findFirst({ where: { userId, action: 'BROWSER_SESSION_RECOVERED', resourceId: stale.id } })).resolves.not.toBeNull();
+    await expect(prisma.outboxEvent.findFirst({ where: { userId, aggregateId: stale.id, eventType: 'browser-session.recovered' } })).resolves.not.toBeNull();
   });
 });

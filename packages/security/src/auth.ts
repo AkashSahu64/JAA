@@ -1,4 +1,5 @@
 import bcrypt from 'bcryptjs';
+import { randomUUID } from 'node:crypto';
 import jwt from 'jsonwebtoken';
 import type { JwtPayload } from 'jsonwebtoken';
 
@@ -58,6 +59,7 @@ function signToken(payload: JWTPayload, tokenType: TokenType, expiresIn: jwt.Sig
     algorithm: 'HS256',
     issuer: JWT_ISSUER,
     audience: JWT_AUDIENCE,
+    jwtid: randomUUID(),
   });
 }
 

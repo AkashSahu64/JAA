@@ -1,5 +1,5 @@
 import jwt from 'jsonwebtoken';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   generateRefreshToken,
   generateToken,
@@ -18,6 +18,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  vi.useRealTimers();
   if (originalSecret === undefined) delete process.env.JWT_SECRET;
   else process.env.JWT_SECRET = originalSecret;
 });
@@ -41,6 +42,15 @@ describe('password utilities', () => {
 });
 
 describe('JWT utilities', () => {
+  it('issues distinct refresh identities within the same clock second', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-09-15T10:00:00Z'));
+    const first = generateRefreshToken(payload);
+    const second = generateRefreshToken(payload);
+    expect(first).not.toBe(second);
+    expect(verifyRefreshToken(first)).toEqual(payload);
+    expect(verifyRefreshToken(second)).toEqual(payload);
+  });
   it('round-trips access and refresh tokens only through matching verifiers', () => {
     const access = generateToken(payload);
     const refresh = generateRefreshToken(payload);

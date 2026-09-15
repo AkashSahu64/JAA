@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { GreenhouseApplicationAdapter, type GreenhouseFormPort } from './greenhouse';
+import { greenhouseApplicationHost, GreenhouseApplicationAdapter, type GreenhouseFormPort } from './greenhouse';
 
 function port(snapshot: Awaited<ReturnType<GreenhouseFormPort['snapshot']>>) {
   return {
@@ -13,9 +13,17 @@ function port(snapshot: Awaited<ReturnType<GreenhouseFormPort['snapshot']>>) {
 }
 
 describe('GreenhouseApplicationAdapter', () => {
+  it('accepts only HTTPS Greenhouse application hosts', () => {
+    expect(greenhouseApplicationHost('https://boards.greenhouse.io/acme/apply')).toBe('boards.greenhouse.io');
+    expect(greenhouseApplicationHost('https://attacker.greenhouse.io/acme/apply')).toBeNull();
+    expect(greenhouseApplicationHost('http://boards.greenhouse.io/acme/apply')).toBeNull();
+    expect(greenhouseApplicationHost('https://user:secret@boards.greenhouse.io/acme/apply')).toBeNull();
+    expect(greenhouseApplicationHost('https://boards.greenhouse.io:8443/acme/apply')).toBeNull();
+    expect(greenhouseApplicationHost('https://example.invalid/apply')).toBeNull();
+  });
   it('fills only mapped approved profile data and advances a valid basic step', async () => {
     const form = port({
-      step: 1,
+      provider: 'GREENHOUSE', step: 1, stepIdentity: 'greenhouse-step-1',
       hasNextStep: true,
       fields: [
         { id: 'first', name: 'first_name', label: 'First name', kind: 'TEXT', required: true },
@@ -30,6 +38,18 @@ describe('GreenhouseApplicationAdapter', () => {
     expect(form.fill).toHaveBeenCalledTimes(3);
     expect(result).toMatchObject({ filledFieldIds: ['first', 'last', 'email'], advanced: true });
     expect(form.advance).toHaveBeenCalledOnce();
+  });
+
+  it('fails closed when a Greenhouse adapter receives a cross-provider snapshot', async () => {
+    const form = port({
+      provider: 'LEVER', step: 1, stepIdentity: 'lever-step-1', hasNextStep: true,
+      fields: [{ id: 'email', name: 'email', label: 'Email', kind: 'TEXT', required: true }],
+    });
+    const result = await new GreenhouseApplicationAdapter().fillCurrentStep(form, { email: 'ada@example.invalid' });
+    expect(result.fields).toEqual([]);
+    expect(result.advanced).toBe(false);
+    expect(form.fill).not.toHaveBeenCalled();
+    expect(form.advance).not.toHaveBeenCalled();
   });
 
   it('halts for custom required answers, uploads, and verification without fabricating data', async () => {
@@ -56,7 +76,7 @@ describe('GreenhouseApplicationAdapter', () => {
 
   it('does not advance when an approved required profile field has no usable value', async () => {
     const form = port({
-      step: 1,
+      provider: 'GREENHOUSE', step: 1, stepIdentity: 'greenhouse-step-1',
       hasNextStep: true,
       fields: [{ id: 'email', name: 'email', label: 'Email', kind: 'TEXT', required: true }],
     });
@@ -70,7 +90,7 @@ describe('GreenhouseApplicationAdapter', () => {
 
   it('does not advance when browser validation reports errors', async () => {
     const form = port({
-      step: 1,
+      provider: 'GREENHOUSE', step: 1, stepIdentity: 'greenhouse-step-1',
       hasNextStep: true,
       fields: [{ id: 'email', name: 'email', label: 'Email', kind: 'TEXT', required: true }],
     });

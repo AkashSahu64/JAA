@@ -1,5 +1,5 @@
 import { Router, Response } from 'express';
-import { prisma } from '@jobagent/database';
+import { withTenant } from '@jobagent/database';
 import { authenticate, AuthenticatedRequest } from '../middleware/auth';
 import {
   cancelHumanVerification,
@@ -28,7 +28,7 @@ function errorStatus(error: HumanVerificationError): number {
 router.get('/', async (req: AuthenticatedRequest, res: Response) => {
   try {
     const status = typeof req.query.status === 'string' ? req.query.status.trim() : '';
-    const verifications = await prisma.humanVerification.findMany({
+    const verifications = await withTenant(req.user!.userId, tx => tx.humanVerification.findMany({
       where: { userId: req.user!.userId, ...(status ? { status } : {}) },
       select: {
         id: true, applicationId: true, type: true, status: true, prompt: true, context: true,
@@ -36,7 +36,7 @@ router.get('/', async (req: AuthenticatedRequest, res: Response) => {
       },
       orderBy: { createdAt: 'desc' },
       take: 100,
-    });
+    }));
     return res.json({ success: true, data: verifications });
   } catch {
     return res.status(500).json({ success: false, error: 'Failed to fetch human verifications' });
@@ -45,13 +45,13 @@ router.get('/', async (req: AuthenticatedRequest, res: Response) => {
 
 router.get('/:id', async (req: AuthenticatedRequest, res: Response) => {
   try {
-    const verification = await prisma.humanVerification.findFirst({
+    const verification = await withTenant(req.user!.userId, tx => tx.humanVerification.findFirst({
       where: { id: req.params.id, userId: req.user!.userId },
       select: {
         id: true, applicationId: true, type: true, status: true, prompt: true, context: true,
         expiresAt: true, resolvedAt: true, resolution: true, resumeToStatus: true, createdAt: true, updatedAt: true,
       },
-    });
+    }));
     if (!verification) return res.status(404).json({ success: false, error: 'Human verification not found' });
     return res.json({ success: true, data: verification });
   } catch {

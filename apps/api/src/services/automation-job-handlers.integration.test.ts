@@ -96,7 +96,7 @@ describeDatabase.sequential('production automation job handlers', () => {
     };
     analyze.mockResolvedValueOnce(result);
     const handlers = createProductionAutomationJobHandlers();
-    expect([...handlers.keys()]).toEqual(['ANALYZE_JOB', 'MATCH_JOB', 'TAILOR_RESUME', 'EVALUATE_ATS', 'EVALUATE_APPLICATION_QUALITY', 'COMPLETE_GREENHOUSE_APPLICATION', 'COMPLETE_LEVER_APPLICATION', 'RESUME_APPLICATION_AFTER_VERIFICATION', 'DISCOVER_JOBS']);
+    expect([...handlers.keys()]).toEqual(['ANALYZE_JOB', 'MATCH_JOB', 'TAILOR_RESUME', 'EVALUATE_ATS', 'EVALUATE_APPLICATION_QUALITY', 'COMPLETE_GREENHOUSE_APPLICATION', 'COMPLETE_LEVER_APPLICATION', 'EXECUTE_AUTHORIZED_SUBMISSION', 'EMAIL_OUTCOME', 'VERIFY_SUBMISSION_CONFIRMATION', 'RESUME_APPLICATION_AFTER_VERIFICATION', 'DISCOVER_JOBS']);
     await handlers.get('ANALYZE_JOB')!({
       automationJobId: randomUUID(),
       userId,

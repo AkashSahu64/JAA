@@ -2,68 +2,69 @@
 
 ## Readiness Decision
 
-**Production readiness: 25/100 — NOT READY.** The repository builds and its limited utility tests pass, but the core product workflow is absent. It should be operated only as a development/assisted dashboard. Real autonomous submission must remain disabled.
+**Production readiness: NOT READY.** The repository now contains durable application state, provider adapters, form intelligence, private-storage boundaries, independent verification, scheduling, notifications, analytics, and recovery controls. Disposable PostgreSQL/Redis/S3 paths, encrypted backup readability, and local Chromium provider execution now have verified evidence, but production deployment/telemetry, live external-provider behavior, broader failure drills, and the final autonomous E2E certification remain incomplete. Real external submission must remain disabled.
 
 | Domain | Score | Current evidence | Release blocker |
 |---|---:|---|---|
-| Product completeness | 28 | CRUD, upload/parsing, manual discovery, read dashboards | No end-to-end application workflow |
-| Database | 59 | PostgreSQL/Prisma schema with 20 models | No migrations, constraints, outbox, idempotency, RLS |
-| API/backend | 44 | Authenticated CRUD/read routes | Missing orchestration, application creation, transition service |
-| Frontend | 48 | Major assisted views exist | Key controls absent; fake notifications |
+| Product completeness | partial | Durable discovery → matching → resume/application preparation and supervised provider paths exist | Full live workflow and final E2E certification are missing |
+| Database | partial | Prisma schema, versioned migrations, tenant predicates/RLS migrations, outbox, idempotency, and durable leases exist; all 41 migrations are applied in disposable PostgreSQL and the aggregate runner passes 28 files/115 tests | Production deployment, destructive restore, and broader live SQL evidence remain gated |
+| API/backend | partial | Authenticated orchestration, lifecycle transitions, submission attempts, verification, scheduling, outcomes, and analytics exist | Live infrastructure execution remains gated |
+| Frontend | partial | Dashboard reflects jobs, applications, schedules, notifications, outcomes, and analytics from API data | Full live-state UX and E2E dashboard evidence are missing |
 | AI/agents | 28 | Provider and specialized prompt classes | No production invocation, schemas, provenance, evaluation |
-| Queue/workers | 0 | None | Redis/BullMQ and all worker semantics absent |
-| Browser/submission | 0 | None | Entire execution and verification subsystem absent |
-| Security/privacy | 48 | bcrypt, JWT checks, Helmet/CORS/rate limits | Refresh revocation, RLS, secrets, file/PII controls absent |
-| Observability | 18 | Logging and heartbeat SSE | No traces, metrics, alerts, distributed event transport |
-| Testing | 18 | 22 utility tests; lint/typecheck/build pass | No API/DB/AI/worker/browser/E2E coverage |
-| Infrastructure | 25 | Local PostgreSQL Compose declaration | No Redis, storage, workers, deployment/backup topology |
-| Operations/recovery | 10 | Some attempt/run fields | No leases, DLQ, replay, restore test, graceful drain |
+| Queue/workers | partial | Redis/BullMQ workers, leases, retries, DLQ, renewal/error callbacks, and durable dispatch exist | Writable Redis and outage/restart drills are gated |
+| Browser/submission | partial | Greenhouse/Lever adapters, provider-neutral form intelligence, exact documents, human handoff, independent verification, and a real local Chromium provider-service → verifier fixture exist | External-provider behavior and production browser operations remain gated |
+| Security/privacy | partial | Auth, refresh sessions, tenant checks/RLS migrations, credential isolation, document validation, encryption, and prompt-injection boundaries exist | Full deployment audit and cross-tenant live evidence remain |
+| Observability | partial | Correlation IDs, structured bounded/redacted logs, request/worker events, SSE, and durable notifications exist | Metrics/traces/log shipping/alerts are not validated |
+| Testing | partial | Controlled unit/browser suites plus live disposable PostgreSQL (28 files/115 tests), Redis outage recovery (1/1), S3 (3/3), live local Chromium certification, and non-destructive encrypted backup evidence are recorded; gated files remain explicitly excluded from pass counts | Full discovery-to-dashboard E2E, external provider behavior, destructive restore, and broader failure drills remain incomplete |
+| Infrastructure | partial | Compose declares PostgreSQL, Redis, MinIO, health checks, and private-bucket initialization; disposable services were exercised through the approved Docker path | Production topology, scaling, and managed service operations remain unverified |
+| Operations/recovery | partial | Leases, retries, dead-lettering, reconciliation, graceful drain, backup/restore scripts, and a non-destructive encrypted Docker backup drill exist | Destructive restore, measured RPO/RTO, and production crash/restart drills are not executed |
 
 ## Verified Build Health
 
-The audit observed:
+## Current Environment Revalidation (2026-09-15)
+
+The disposable-service results below are historical evidence from an earlier controlled environment and were not reproduced in the current session. Docker Desktop start/status was attempted through the approved local command, but the Linux engine API named pipe remained absent; `docker info` therefore still failed. The latest full `npm test` rerun completed with 82 test files and 747 tests passed, with 36 files and 132 tests explicitly skipped. Focused tests and static checks are also passing, while PostgreSQL, Redis, MinIO/S3 runtime, and full autonomous E2E claims remain environment-gated.
+
+The latest controlled audit observed:
 
 ```text
 ESLint: passed
-TypeScript: passed in 7 workspaces
-Vitest: 3 source test files; 22 passed, 0 failed, 0 skipped
+TypeScript: passed in all configured workspaces
+Vitest controlled serial suite: 76 files and 629 tests passed; 35 files and 125 tests explicitly skipped. Disposable PostgreSQL runner: 28 files and 115 tests passed. Redis outage recovery: 1 test passed. S3 integration: 3 tests passed. Live local Chromium certification: 4 tests passed. Non-destructive encrypted backup drill passed.
 API build: tsc passed
 Web build: tsc && vite build passed; 1503 modules transformed
 ```
 
-This proves source consistency and selected utility behavior only. It does not validate a live database or any product workflow. PostgreSQL verification failed with `P1001: Can't reach database server at localhost:5432`; Docker and `psql` were unavailable, so database behavior remains statically assessed.
+These results prove source consistency and selected disposable infrastructure behavior, including local provider-service execution, but do not validate external provider behavior or the complete product workflow. PostgreSQL, Redis, and MinIO were exercised through the approved Docker path; production deployment, provider variability, destructive restore, and final E2E evidence remain gated.
 
 ## Release Gates
 
 | Gate | Required evidence | Current result |
 |---|---|---|
-| Reproducible environment | Versioned migrations, seed/fixtures, health checks | ❌ Missing; seed target is absent |
-| Live DB correctness | Migration, constraints, concurrency, backup/restore tests | ❌ Not tested |
-| Authentication lifecycle | Rotation, reuse detection, logout/revocation, client refresh | ❌ Incomplete |
-| Tenant isolation | Ownership tests plus PostgreSQL RLS | ❌ No RLS/cross-tenant suite |
-| Durable execution | PostgreSQL command/outbox + BullMQ workers | ❌ Missing |
-| Idempotency | Duplicate delivery and crash recovery tests | ❌ Missing |
-| AI safety/quality | Runtime schemas, provenance, hostile-input evaluations | ❌ Missing |
-| Resume truthfulness | Source facts and deterministic claim verifier | ❌ Missing |
-| Browser safety | URL/tool/file/credential isolation tests | ❌ Browser absent |
-| Submission correctness | Confirmed evidence, no duplicate submission | ❌ Missing |
-| Human approval | Durable CAPTCHA/MFA/sensitive-answer workflow | ❌ Missing |
-| Observability | Metrics, traces, alerts, correlation IDs, runbooks | ❌ Incomplete |
-| Data protection | Object storage, encryption policy, retention/deletion | ❌ Incomplete |
-| Production operations | Deployment, secrets, scaling, rollback, DR rehearsal | ❌ Missing |
+| Reproducible environment | Versioned migrations, seed/fixtures, health checks | ⚠️ Compose, migrations, fixtures, and health checks exist; disposable startup is verified, production startup remains gated |
+| Live DB correctness | Migration, constraints, concurrency, backup/restore tests | ⚠️ Static schema/migrations exist; live migration and restore tests are gated |
+| Authentication lifecycle | Rotation, reuse detection, logout/revocation, client refresh | ⚠️ Durable refresh sessions and revocation exist; live deployment evidence is gated |
+| Tenant isolation | Ownership tests plus PostgreSQL RLS | ⚠️ Ownership/RLS migrations exist; live cross-tenant SQL tests are gated |
+| Durable execution | PostgreSQL command/outbox + BullMQ workers | ⚠️ Implemented and unit-tested; live services are gated |
+| Idempotency | Duplicate delivery and crash recovery tests | ⚠️ Focused replay/recovery coverage exists; live crash drills are gated |
+| AI safety/quality | Runtime schemas, provenance, hostile-input evaluations | ⚠️ Truthfulness/policy gates exist; production model evaluation is incomplete |
+| Resume truthfulness | Source facts and deterministic claim verifier | ⚠️ Implemented with focused coverage; live workflow evidence is gated |
+| Browser safety | URL/tool/file/credential isolation tests | ⚠️ Provider-host and human-handoff controls plus local fixtures exist; live providers are gated |
+| Submission correctness | Confirmed evidence, no duplicate submission | ⚠️ Exact-document/idempotent attempt/independent-verification paths exist; local Chromium/PostgreSQL evidence is verified, external evidence is gated |
+| Human approval | Durable CAPTCHA/MFA/sensitive-answer workflow | ⚠️ Human-verification and approved-answer paths exist; live handoff is gated |
+| Observability | Metrics, traces, alerts, correlation IDs, runbooks | ⚠️ Structured logs/correlation exist; metrics/traces/alerts are incomplete |
+| Data protection | Object storage, encryption policy, retention/deletion | ⚠️ Private S3-compatible boundary and validation exist; disposable S3 upload/auth/tamper evidence is verified, production storage remains gated |
+| Production operations | Deployment, secrets, scaling, rollback, DR rehearsal | ⚠️ Configuration/backup scripts exist; deployment and DR rehearsal are incomplete |
 
 ## Critical Correctness Risks
 
-1. **False automation state:** Start creates `AutomationRun(status=RUNNING)` without launching work.
-2. **Invalid lifecycle:** the PATCH route permits any allowlisted status jump with last-write-wins behavior.
-3. **False operational signals:** Header MFA, submission, and interview notifications are hardcoded; “Mark all read” only closes the menu.
-4. **AI output trust:** `completeJSON<T>` parses syntax but does not enforce schema, ranges, enums, totals, citations, or truthfulness.
-5. **Unverified analytics:** metrics summarize stored rows, not independently verified submissions.
-6. **Provider failure masking:** discovery adapters can convert external errors to empty result sets.
-7. **Session expiry:** refresh tokens are returned but the web client does not store/use them; tokens are stateless and non-revocable.
-8. **File/PII storage:** resume bytes are stored in PostgreSQL without object-storage policy, malware scanning, retention, or deletion workflow.
-9. **Process-local security state:** credential vault data is in a Map and unsuitable for durable production credentials.
-10. **No crash boundary:** there is no durable lease, command, outbox, replay, or worker drain protocol.
+1. **External execution evidence:** local provider/browser execution, independent confirmation, and database state transitions are verified; external provider behavior and production browser operations have not been exercised.
+2. **Infrastructure scope:** disposable PostgreSQL, Redis, and MinIO/S3 paths now have targeted evidence, but this is not production topology or operational proof.
+3. **Integration coverage:** explicitly gated files remain outside the passing counts; their results must not be inferred from unit or fixture tests.
+4. **Telemetry operations:** structured logs and correlation fields exist, but shipping, metrics, traces, alert thresholds, and runbooks are not validated.
+5. **Disaster recovery:** a non-destructive Docker backup drill creates, encrypts, checksums, decrypts, and restore-validates a custom-format dump; destructive restore rehearsal, production key-management/rotation, and measured RPO/RTO evidence remain outstanding.
+6. **Provider variability:** Greenhouse and Lever live pages, policy changes, authentication, CAPTCHA/MFA handoff, and rate-limit behavior remain unverified.
+7. **Final workflow certification:** local submission/verification/dashboard slices pass, but no full USER PROFILE → DISCOVERY → APPLICATION → DOCUMENT → SUBMISSION → VERIFICATION → DASHBOARD E2E certification has passed.
 
 ## Production Topology Decision
 
@@ -103,10 +104,10 @@ Backups require automated encrypted PostgreSQL backups, object versioning/retent
 
 ## Environment Status
 
-`.env.example` declares database, AI, encryption, JWT, API, frontend, and a local storage path. It lacks Redis/BullMQ, S3, browser-worker, email/OAuth, telemetry, and production-secret references. `compose.yaml` declares only PostgreSQL. There is no production deployment, worker topology, reverse proxy, Redis, object store, monitoring, or backup service in the repository.
+`.env.example` declares database, AI, encryption, JWT, API, Redis/BullMQ, private S3-compatible storage, scanner, scheduler, and worker settings. `compose.yaml` declares PostgreSQL, Redis, MinIO, health checks, and private-bucket initialization. There is still no validated production deployment topology, external telemetry sink, OAuth mailbox provider, or completed backup/restore drill.
 
 ## Deployment Recommendation
 
-Do not deploy this as an autonomous agent or enable real submission. A limited internal development deployment may expose authenticated CRUD, manual Greenhouse/Lever import, resume parsing, stored-record dashboards, and generic AI chat only if the UI continues to label these honestly and fake notifications are removed.
+Do not deploy this as an autonomous agent or enable unrestricted real submission. A limited internal development deployment may expose the authenticated discovery, preparation, supervised Greenhouse/Lever, document, verification, scheduling, outcome, and analytics paths while all live-provider and infrastructure gates remain visible and human verification remains mandatory.
 
 Reassess readiness after P0 and P1 gates are implemented and demonstrated through live integration, concurrency, crash-recovery, security, and browser E2E tests. Static classes and passing compilation must not be accepted as release evidence.

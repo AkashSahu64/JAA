@@ -7,6 +7,11 @@ const dockerBin = 'C:\\Program Files\\Docker\\Docker\\resources\\bin';
 const containerName = 'jobagent-goal5-redis-outage';
 const redisPort = '6380';
 const docker = process.env.DOCKER_BIN ?? `${dockerBin}\\docker.exe`;
+const dockerCheck = spawnSync(docker, ['info'], { stdio: 'ignore' });
+if (dockerCheck.error || dockerCheck.status !== 0) {
+  console.error('GATED: Redis outage integration requires a reachable Docker daemon; no integration tests were run.');
+  process.exit(2);
+}
 const remove = spawnSync(docker, ['rm', '-f', containerName], { stdio: 'ignore' });
 if (remove.error && remove.error.code !== 'ENOENT') throw remove.error;
 const start = spawnSync(docker, [
@@ -20,6 +25,7 @@ const env = {
   ...process.env,
   REDIS_OUTAGE_INTEGRATION: '1',
   DATABASE_URL: process.env.DATABASE_URL ?? 'postgresql://jobagent:jobagent-local@localhost:5432/jobagent',
+  DATABASE_ADMIN_URL: process.env.DATABASE_ADMIN_URL ?? process.env.DATABASE_URL ?? 'postgresql://jobagent:jobagent-local@localhost:5432/jobagent',
   REDIS_URL: `redis://127.0.0.1:${redisPort}`,
   REDIS_OUTAGE_PORT: redisPort,
   DOCKER_BIN: docker,

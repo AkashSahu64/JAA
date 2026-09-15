@@ -8,6 +8,14 @@ env.PATH = process.platform === 'win32' ? `${dockerBin};${env.PATH ?? ''}` : env
 if (!env.DATABASE_URL) {
   env.DATABASE_URL = 'postgresql://jobagent:jobagent-local@localhost:5432/jobagent';
 }
+if (!env.DATABASE_ADMIN_URL) {
+  env.DATABASE_ADMIN_URL = env.DATABASE_URL;
+}
+const dockerCheck = spawnSync('docker', ['info'], { stdio: 'ignore', env });
+if (dockerCheck.error || dockerCheck.status !== 0) {
+  console.error('GATED: PostgreSQL integration requires a reachable Docker daemon; no integration tests were run.');
+  process.exit(2);
+}
 const result = spawnSync(
   command,
   [
@@ -21,12 +29,24 @@ const result = spawnSync(
     'apps/api/src/services/browser-session-manager.integration.test.ts',
     'apps/api/src/services/greenhouse-application.integration.test.ts',
     'apps/api/src/services/lever-application.integration.test.ts',
+    'apps/api/src/services/application-answers.integration.test.ts',
     'apps/api/src/services/outbox-idempotency.integration.test.ts',
     'apps/api/src/services/automation-jobs.integration.test.ts',
     'apps/api/src/services/automation-job-handlers.integration.test.ts',
     'apps/api/src/services/candidate-facts.integration.test.ts',
+    'apps/api/src/services/refresh-sessions.integration.test.ts',
     'apps/api/src/services/document-storage.integration.test.ts',
     'apps/api/src/services/submission-engine.integration.test.ts',
+    'apps/api/src/services/submission-verification.integration.test.ts',
+    'apps/api/src/services/durable-scheduler.integration.test.ts',
+    'apps/api/src/services/notification-outbox.integration.test.ts',
+    'apps/api/src/services/email-outcomes.integration.test.ts',
+    'apps/api/src/services/durable-credentials.integration.test.ts',
+    'apps/api/src/server.integration.test.ts',
+    'apps/api/src/routes/automation-metrics.integration.test.ts',
+    'apps/api/src/services/autonomous-e2e.integration.test.ts',
+    'apps/api/src/services/application-lifecycle.integration.test.ts',
+    'apps/api/src/routes/analytics.integration.test.ts',
     'apps/api/src/services/job-discovery.integration.test.ts',
     'apps/api/src/services/job-discovery.contract.test.ts',
   ],

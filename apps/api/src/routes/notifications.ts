@@ -1,5 +1,5 @@
 import { Router, Response } from 'express';
-import { prisma } from '@jobagent/database';
+import { withTenant } from '@jobagent/database';
 import { authenticate, AuthenticatedRequest } from '../middleware/auth';
 
 const router = Router();
@@ -11,11 +11,11 @@ router.get('/', async (req: AuthenticatedRequest, res: Response) => {
     const where: any = { userId: req.user!.userId };
     if (unreadOnly) where.read = false;
     
-    const notifications = await prisma.notification.findMany({
+    const notifications = await withTenant(req.user!.userId, tx => tx.notification.findMany({
       where,
       orderBy: { createdAt: 'desc' },
       take: 50,
-    });
+    }));
     return res.json({ success: true, data: notifications });
   } catch (error) {
     return res.status(500).json({ success: false, error: 'Failed to fetch notifications' });
@@ -24,10 +24,10 @@ router.get('/', async (req: AuthenticatedRequest, res: Response) => {
 
 router.patch('/:id/read', async (req: AuthenticatedRequest, res: Response) => {
   try {
-    const notification = await prisma.notification.updateMany({
+    const notification = await withTenant(req.user!.userId, tx => tx.notification.updateMany({
       where: { id: req.params.id, userId: req.user!.userId },
       data: { read: true },
-    });
+    }));
     if (notification.count === 0) {
       return res.status(404).json({ success: false, error: 'Notification not found' });
     }
@@ -39,10 +39,10 @@ router.patch('/:id/read', async (req: AuthenticatedRequest, res: Response) => {
 
 router.post('/mark-all-read', async (req: AuthenticatedRequest, res: Response) => {
   try {
-    await prisma.notification.updateMany({
+    await withTenant(req.user!.userId, tx => tx.notification.updateMany({
       where: { userId: req.user!.userId, read: false },
       data: { read: true },
-    });
+    }));
     return res.json({ success: true, message: 'All notifications marked as read' });
   } catch (error) {
     return res.status(500).json({ success: false, error: 'Failed to mark notifications' });

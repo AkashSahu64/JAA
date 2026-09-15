@@ -20,8 +20,21 @@ function hash(value: unknown): string {
   return createHash('sha256').update(JSON.stringify(value), 'utf8').digest('hex');
 }
 
-function utcDay(now: Date): Date {
-  return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+export function profileCalendarDay(now: Date, timeZone: string): Date {
+  if (!(now instanceof Date) || !Number.isFinite(now.getTime()) || typeof timeZone !== 'string' || !timeZone.trim()) {
+    throw new ApplicationQualityError('INVALID', 'Application quality time zone is invalid');
+  }
+  try {
+    const parts = new Intl.DateTimeFormat('en-US', { timeZone, year: 'numeric', month: '2-digit', day: '2-digit' }).formatToParts(now);
+    const value = (type: string) => Number(parts.find(part => part.type === type)?.value);
+    const year = value('year');
+    const month = value('month');
+    const day = value('day');
+    if (![year, month, day].every(Number.isSafeInteger)) throw new Error('invalid calendar parts');
+    return new Date(Date.UTC(year, month - 1, day));
+  } catch {
+    throw new ApplicationQualityError('INVALID', 'Application quality time zone is invalid');
+  }
 }
 
 function conditions(value: Prisma.JsonValue): QualityRuleCondition[] | null {
@@ -66,10 +79,9 @@ export async function executeApplicationQuality(input: ExecuteApplicationQuality
     throw new ApplicationQualityError('INVALID', 'User, application, and search profile identifiers are required');
   }
   const now = input.now ?? new Date();
-  const day = utcDay(now);
+  if (!(now instanceof Date) || !Number.isFinite(now.getTime())) throw new ApplicationQualityError('INVALID', 'Application quality time is invalid');
   return withTenant(input.userId, async tx => {
-    await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`${input.userId}:application-quality:${day.toISOString()}`}, 0))`;
-    await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`${input.userId}:${input.applicationId}:application-quality`}, 0))`;
+    await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`${input.userId}:application-quality`}, 0))`;
     const [application, profile, rules, reserved] = await Promise.all([
       tx.application.findFirst({ where: { id: input.applicationId, userId: input.userId }, include: { job: true, resumeVersion: true } }),
       tx.searchProfile.findFirst({ where: { id: input.searchProfileId, userId: input.userId, isActive: true } }),
@@ -77,6 +89,8 @@ export async function executeApplicationQuality(input: ExecuteApplicationQuality
       tx.dailyApplicationBudgetReservation.findUnique({ where: { applicationId: input.applicationId } }),
     ]);
     if (!application || !profile) throw new ApplicationQualityError('NOT_FOUND', 'Application or active search profile not found');
+    const day = profileCalendarDay(now, profile.timeZone);
+    await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`${input.userId}:${input.applicationId}:application-quality:${day.toISOString()}`}, 0))`;
     const jobMatch = await tx.jobMatch.findFirst({ where: { userId: input.userId, jobId: application.jobId } });
     const otherReservations = await tx.dailyApplicationBudgetReservation.count({
       where: { userId: input.userId, day, applicationId: { not: application.id } },

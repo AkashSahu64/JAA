@@ -6,6 +6,7 @@ import type { AutomationWorkerResult } from './worker';
 const harness = vi.hoisted(() => ({
   processor: undefined as unknown,
   options: undefined as unknown,
+  workerError: undefined as unknown,
 }));
 
 vi.mock('bullmq', () => ({
@@ -17,6 +18,10 @@ vi.mock('bullmq', () => ({
     pause = vi.fn();
     resume = vi.fn();
     close = vi.fn();
+    on = vi.fn((event: string, handler: (error: unknown) => void) => {
+      if (event === 'error') harness.workerError = handler;
+      return this;
+    });
 
     constructor(_name: string, processor: unknown, options: unknown) {
       harness.processor = processor;
@@ -55,6 +60,7 @@ describe('AutomationQueueWorker retries', () => {
     vi.useRealTimers();
     harness.processor = undefined;
     harness.options = undefined;
+    harness.workerError = undefined;
   });
 
   it('serializes automatic renewals and does not abort on a transient renewal failure', async () => {
@@ -62,6 +68,7 @@ describe('AutomationQueueWorker retries', () => {
     let releaseFirst!: () => void;
     const firstRenewal = new Promise<void>((resolve) => { releaseFirst = resolve; });
     let renewalCalls = 0;
+    const heartbeatErrors: string[] = [];
     let releaseProcessor!: () => void;
     const processorReleased = new Promise<void>((resolve) => { releaseProcessor = resolve; });
     let observedSignal: AbortSignal | undefined;
@@ -80,6 +87,7 @@ describe('AutomationQueueWorker retries', () => {
         if (renewalCalls === 1) await firstRenewal;
         else if (renewalCalls === 2) throw new Error('transient database outage');
       },
+      onHeartbeatError: (_message, error) => heartbeatErrors.push(error.message),
       isLeaseLost: (error) => error instanceof Error && error.message === 'lease lost',
     });
     const processing = (harness.processor as Processor)(queueJob(initialMessage));
@@ -92,6 +100,7 @@ describe('AutomationQueueWorker retries', () => {
     expect(renewalCalls).toBe(1);
     await vi.advanceTimersByTimeAsync(1_000);
     expect(renewalCalls).toBe(2);
+    expect(heartbeatErrors).toEqual(['transient database outage']);
     expect(observedSignal?.aborted).toBe(false);
 
     releaseProcessor();
@@ -205,5 +214,36 @@ describe('AutomationQueueWorker retries', () => {
       .rejects.toThrow('authoritative attempt conflict');
     expect(job.updateData).not.toHaveBeenCalled();
     await worker.close();
+  });
+
+  it('forwards unscoped BullMQ worker errors to the operational callback', async () => {
+    const onWorkerError = vi.fn();
+    const worker = new AutomationQueueWorker('applications', {
+      workerId: 'worker', processor: async () => undefined, onFailure: async () => 'IGNORED',
+      shouldRetry: async () => false, onComplete: async () => undefined, onRenew: async () => undefined,
+      onWorkerError,
+    });
+    (harness.workerError as (error: unknown) => void)(new Error('redis connection lost'));
+    expect(onWorkerError).toHaveBeenCalledWith(expect.objectContaining({ message: 'redis connection lost' }));
+    await worker.close();
+  });
+
+  it('aborts active processors before a forced shutdown', async () => {
+    let observedSignal: AbortSignal | undefined;
+    let releaseProcessor!: () => void;
+    const processorReleased = new Promise<void>((resolve) => { releaseProcessor = resolve; });
+    const worker = new AutomationQueueWorker('applications', {
+      workerId: 'worker', processor: async (_message, context) => {
+        observedSignal = context.signal;
+        await processorReleased;
+      }, onFailure: async () => 'IGNORED', shouldRetry: async () => false,
+      onComplete: async () => undefined, onRenew: async () => undefined,
+    });
+    const processing = (harness.processor as Processor)(queueJob(initialMessage));
+    await Promise.resolve();
+    await worker.close(true);
+    expect(observedSignal?.aborted).toBe(true);
+    releaseProcessor();
+    await processing;
   });
 });

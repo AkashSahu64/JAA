@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { bullPriority, deadLetterQueueName, queueForJobType } from './names';
-import { queueJobId } from './registry';
-import { retryDelayMs, retryJitter } from './worker';
+import { queueJobId, validateEnqueueAutomationJobInput } from './registry';
+import { MAX_RETRY_DELAY_MS, retryDelayMs, retryJitter } from './worker';
 
 describe('automation queue semantics', () => {
   it.each([
@@ -40,5 +40,24 @@ describe('automation queue semantics', () => {
     expect(retryDelayMs(1, 1_000, 0)).toBe(750);
     expect(retryDelayMs(1, 1_000, 1)).toBe(1_250);
     expect(retryDelayMs(2, 1_000, 0.5)).toBe(2_000);
+  });
+
+  it('keeps overflow and malformed retry inputs fail-safe', () => {
+    expect(retryDelayMs(10_000, 1_000, 0.5)).toBeLessThanOrEqual(MAX_RETRY_DELAY_MS);
+    expect(retryDelayMs(1, 1_000, Number.NaN)).toBe(1_000);
+    expect(() => retryDelayMs(0)).toThrow('positive integer');
+    expect(() => retryDelayMs(1, 0)).toThrow('positive integer');
+  });
+
+  it('rejects malformed queue envelopes before they reach BullMQ', () => {
+    const valid = {
+      automationJobId: 'job-1', type: 'APPLICATION_SUBMIT', correlationId: 'corr-1',
+      payloadVersion: 1, deliveryGeneration: 1, dispatchAttempt: 1,
+      priority: 0, availableAt: new Date(), maxAttempts: 3,
+    };
+    expect(() => validateEnqueueAutomationJobInput(valid)).not.toThrow();
+    expect(() => validateEnqueueAutomationJobInput({ ...valid, availableAt: new Date(Number.NaN) })).toThrow('availableAt');
+    expect(() => validateEnqueueAutomationJobInput({ ...valid, dispatchAttempt: 0 })).toThrow('dispatchAttempt');
+    expect(() => validateEnqueueAutomationJobInput({ ...valid, correlationId: 'corr\nforged' })).toThrow('correlationId');
   });
 });

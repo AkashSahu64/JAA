@@ -1,7 +1,8 @@
 import { randomUUID } from 'node:crypto';
 import { JobStatus, type AutomationJob } from '@prisma/client';
-import { prisma } from '@jobagent/database';
+import { withService, withTenant } from '@jobagent/database';
 import { AutomationQueueRegistry } from '@jobagent/queue';
+import { safeErrorMessage } from '../observability/structured-log';
 
 export interface DispatchAutomationJobsOptions {
   batchSize?: number;
@@ -20,7 +21,7 @@ function positiveInteger(value: number, name: string): void {
 }
 
 async function selectDispatchable(batchSize: number, now: Date, userId?: string): Promise<AutomationJob[]> {
-  return prisma.$transaction((tx) => tx.$queryRaw<AutomationJob[]>`
+  return withService((tx) => tx.$queryRaw<AutomationJob[]>`
     SELECT job.*
     FROM automation_jobs AS job
     LEFT JOIN automation_runs AS run ON run.id = job."automationRunId"
@@ -67,7 +68,7 @@ export async function dispatchAutomationJobs(
       result.dispatched += 1;
     } catch (error) {
       result.failed += 1;
-      await prisma.auditLog.create({
+      await withTenant(job.userId, (tx) => tx.auditLog.create({
         data: {
           userId: job.userId,
           action: 'AUTOMATION_JOB_DISPATCH_FAILED',
@@ -75,11 +76,11 @@ export async function dispatchAutomationJobs(
           resourceId: job.id,
           details: {
             correlationId: job.correlationId,
-            error: error instanceof Error ? error.message.slice(0, 10_000) : String(error).slice(0, 10_000),
+            error: safeErrorMessage(error),
             dispatchId: randomUUID(),
           },
         },
-      });
+      }));
     }
   }
   return result;

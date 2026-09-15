@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
+import { safeErrorMessage } from '../observability/structured-log';
 import { Prisma, type OutboxEvent } from '@prisma/client';
-import { prisma } from '@jobagent/database';
+import { withService } from '@jobagent/database';
 
 export interface OutboxEnvelope {
   id: string;
@@ -53,7 +54,7 @@ async function claimEvents(
   now: Date,
 ): Promise<OutboxEvent[]> {
   const leaseExpiresAt = new Date(now.getTime() + leaseMs);
-  return prisma.$transaction(async (tx) => {
+  return withService(async (tx) => {
     await tx.outboxEvent.updateMany({
       where: {
         publishedAt: null,
@@ -111,7 +112,7 @@ function envelope(event: OutboxEvent): OutboxEnvelope {
 }
 
 function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message.slice(0, 10_000) : String(error).slice(0, 10_000);
+  return safeErrorMessage(error);
 }
 
 export async function publishOutboxBatch(
@@ -127,6 +128,7 @@ export async function publishOutboxBatch(
     now: options.now ?? new Date(),
   };
   validateOptions(configured);
+  if (!(configured.now instanceof Date) || !Number.isFinite(configured.now.getTime())) throw new Error('now must be a valid Date');
   const events = await claimEvents(configured.workerId, options.userId, configured.batchSize, configured.maxAttempts, configured.leaseMs, configured.now);
   const result: PublishOutboxResult = { claimed: events.length, published: 0, retried: 0, failed: 0 };
 
@@ -135,16 +137,16 @@ export async function publishOutboxBatch(
     try {
       await transport(message);
       await options.afterPublish?.(message);
-      const marked = await prisma.outboxEvent.updateMany({
+      const marked = await withService(tx => tx.outboxEvent.updateMany({
         where: { id: event.id, leaseOwner: configured.workerId, publishedAt: null, failedAt: null },
         data: { publishedAt: new Date(), leaseOwner: null, leaseExpiresAt: null, lastError: null },
-      });
+      }));
       if (marked.count !== 1) throw new Error(`Lost outbox lease for ${event.id}`);
       result.published += 1;
     } catch (error) {
       const terminal = event.publishAttempts >= configured.maxAttempts;
       const retryDelay = configured.baseRetryMs * 2 ** Math.max(0, event.publishAttempts - 1);
-      await prisma.outboxEvent.updateMany({
+      await withService(tx => tx.outboxEvent.updateMany({
         where: { id: event.id, leaseOwner: configured.workerId, publishedAt: null, failedAt: null },
         data: {
           leaseOwner: null,
@@ -152,7 +154,7 @@ export async function publishOutboxBatch(
           lastError: errorMessage(error),
           ...(terminal ? { failedAt: new Date() } : { availableAt: new Date(configured.now.getTime() + retryDelay) }),
         },
-      });
+      }));
       if (terminal) result.failed += 1;
       else result.retried += 1;
     }

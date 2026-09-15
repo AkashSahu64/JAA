@@ -4,6 +4,7 @@ import {
   AutomationEvent,
   AutomationRun,
   DashboardStats,
+  ApplicationFunnelRow,
   DiscoveryRequest,
   DiscoveryRunStatus,
   DiscoveryRunSummary,
@@ -12,10 +13,16 @@ import {
   UIResume,
   UIResumeVersion,
   UICandidateFact,
+  UIInterview,
+  OfferRecord,
+  UIEmailOutcome,
+  UIEmailConnection,
+  UISearchProfile,
 } from '../types';
 
 const API_BASE = '/api';
 const TOKEN_KEY = 'jobagent.accessToken';
+const REFRESH_TOKEN_KEY = 'jobagent.refreshToken';
 const USER_KEY = 'jobagent.user';
 
 interface ApiEnvelope<T> {
@@ -62,12 +69,14 @@ function getStoredUser(): AuthUser | null {
 
 function storeSession(payload: AuthPayload): AuthSession {
   window.sessionStorage.setItem(TOKEN_KEY, payload.token);
+  window.sessionStorage.setItem(REFRESH_TOKEN_KEY, payload.refreshToken);
   window.sessionStorage.setItem(USER_KEY, JSON.stringify(payload.user));
   return { user: payload.user, token: payload.token };
 }
 
 export function clearSession(): void {
   window.sessionStorage.removeItem(TOKEN_KEY);
+  window.sessionStorage.removeItem(REFRESH_TOKEN_KEY);
   window.sessionStorage.removeItem(USER_KEY);
   window.localStorage.removeItem(TOKEN_KEY);
 }
@@ -78,6 +87,15 @@ export function getAccessToken(): string | null {
 
 export function hasApiToken(): boolean {
   return Boolean(getAccessToken());
+}
+
+export async function logout(): Promise<void> {
+  const refreshToken = window.sessionStorage.getItem(REFRESH_TOKEN_KEY);
+  try {
+    if (refreshToken) await apiRequest<{ revoked: boolean }>('/auth/logout', { method: 'POST', body: JSON.stringify({ refreshToken }) });
+  } finally {
+    clearSession();
+  }
 }
 
 export async function apiRequest<T>(path: string, init: RequestInit = {}): Promise<T> {
@@ -168,7 +186,7 @@ export async function fetchApplications(status?: string): Promise<UIApplication[
 
 export async function fetchApplication(id: string): Promise<UIApplication> {
   const app = await apiRequest<RawApplicationDetail>(`/applications/${encodeURIComponent(id)}`);
-  return { ...toUIApplication(app), attempts: app.attempts?.map(toAttempt) ?? [] };
+  return { ...toUIApplication(app), attempts: app.attempts?.map(toAttempt) ?? [], interviews: app.interviews ?? [], offers: app.offers ?? [], emailOutcomes: app.emailOutcomes ?? [], jobs: app.jobs ?? [] };
 }
 
 export async function fetchResumes(): Promise<UIResume[]> {
@@ -199,6 +217,72 @@ export async function decideResumeFact(resumeId: string, factId: string, decisio
   });
 }
 
+export function decideOffer(applicationId: string, offerId: string, decision: 'ACCEPTED' | 'DECLINED' | 'WITHDRAWN' | 'EXPIRED'): Promise<OfferRecord> {
+  return apiRequest<OfferRecord>(`/applications/${encodeURIComponent(applicationId)}/offers/${encodeURIComponent(offerId)}/decision`, {
+    method: 'PATCH',
+    headers: { 'Idempotency-Key': crypto.randomUUID() },
+    body: JSON.stringify({ decision }),
+  });
+}
+
+export async function applyEmailOutcome(outcomeId: string, expectedVersion: number, correlationId: string): Promise<UIApplication> {
+  const result = await apiRequest<{ application: RawApplicationDetail }>(`/email-outcomes/${encodeURIComponent(outcomeId)}/apply`, {
+    method: 'POST',
+    headers: { 'Idempotency-Key': crypto.randomUUID() },
+    body: JSON.stringify({ expectedVersion, correlationId }),
+  });
+  const application = result.application;
+  return { ...toUIApplication(application), attempts: application.attempts?.map(toAttempt) ?? [], interviews: application.interviews ?? [], offers: application.offers ?? [], emailOutcomes: application.emailOutcomes ?? [] };
+}
+
+export async function reviewEmailOutcome(outcomeId: string): Promise<void> {
+  await apiEnvelopeRequest<ApiEnvelope<never>>(`/email-outcomes/${encodeURIComponent(outcomeId)}/review`, { method: 'POST' }, false);
+}
+
+export function fetchEmailConnections(): Promise<UIEmailConnection[]> {
+  return apiRequest<UIEmailConnection[]>('/email-connections');
+}
+
+export async function revokeEmailConnection(connectionId: string): Promise<void> {
+  await apiEnvelopeRequest<ApiEnvelope<never>>(`/email-connections/${encodeURIComponent(connectionId)}`, { method: 'DELETE' }, false);
+}
+
+export function recordInterview(applicationId: string, input: Pick<UIInterview, 'type' | 'company' | 'role'> & { date?: string }): Promise<UIInterview> {
+  return apiRequest<UIInterview>(`/applications/${encodeURIComponent(applicationId)}/interviews`, {
+    method: 'POST',
+    headers: { 'Idempotency-Key': crypto.randomUUID() },
+    body: JSON.stringify(input),
+  });
+}
+
+export function recordOffer(applicationId: string, input: Pick<OfferRecord, 'company' | 'role'> & { salaryOffered?: number; currency?: string; startDate?: string; expiresAt?: string; benefits?: string }): Promise<OfferRecord> {
+  return apiRequest<OfferRecord>(`/applications/${encodeURIComponent(applicationId)}/offers`, {
+    method: 'POST',
+    headers: { 'Idempotency-Key': crypto.randomUUID() },
+    body: JSON.stringify(input),
+  });
+}
+
+export function authorizeSubmission(applicationId: string, expectedVersion: number, correlationId: string): Promise<{ authorizationId: string; automationJobId: string; status: string; replayed?: boolean }> {
+  return apiRequest(`/applications/${encodeURIComponent(applicationId)}/authorize-submission`, {
+    method: 'POST',
+    headers: { 'Idempotency-Key': crypto.randomUUID() },
+    body: JSON.stringify({ expectedVersion, correlationId }),
+  });
+}
+
+export function scheduleApplicationRun(applicationId: string, runAt: string, automationRunId?: string): Promise<{ id: string; status: string; availableAt: string; replayed?: boolean }> {
+  return apiRequest(`/applications/${encodeURIComponent(applicationId)}/schedule`, {
+    method: 'POST',
+    headers: { 'Idempotency-Key': crypto.randomUUID() },
+    body: JSON.stringify({ runAt, correlationId: `dashboard-schedule:${applicationId}`, ...(automationRunId ? { automationRunId } : {}) }),
+  });
+}
+
+export async function cancelAutomationJob(jobId: string): Promise<void> {
+  await apiRequest(`/automation/jobs/${encodeURIComponent(jobId)}/cancel`, { method: 'POST' });
+}
+
 export async function chatWithAssistant(messages: Array<{ role: 'user' | 'assistant'; content: string }>): Promise<string> {
   const result = await apiRequest<{ reply: string }>('/ai/chat', {
     method: 'POST',
@@ -215,8 +299,28 @@ export function fetchApplicationTimeline(days = 30): Promise<Array<{ date: strin
   return apiRequest<Array<{ date: string; count: number }>>(`/analytics/applications-over-time?days=${days}`);
 }
 
+export function fetchApplicationFunnel(days = 30): Promise<ApplicationFunnelRow[]> {
+  return apiRequest<ApplicationFunnelRow[]>(`/analytics/applications-funnel?days=${days}`);
+}
+
 export function fetchRules(): Promise<UIRule[]> {
   return apiRequest<UIRule[]>('/rules');
+}
+
+export function fetchSearchProfiles(): Promise<UISearchProfile[]> {
+  return apiRequest<UISearchProfile[]>('/search-profiles');
+}
+
+export function createSearchProfile(input: { name: string; targetRoles: string[]; cities: string[]; schedule: string; customCron?: string; timeZone?: string; maxApplicationsPerDay?: number; discoveryAccounts: Array<{ source: 'GREENHOUSE' | 'LEVER' | 'ASHBY'; account: string }> }): Promise<UISearchProfile> {
+  return apiRequest<UISearchProfile>('/search-profiles', { method: 'POST', body: JSON.stringify(input) });
+}
+
+export function setSearchProfileActive(id: string, isActive: boolean): Promise<UISearchProfile> {
+  return apiRequest<UISearchProfile>(`/search-profiles/${encodeURIComponent(id)}`, { method: 'PUT', body: JSON.stringify({ isActive }) });
+}
+
+export async function deleteSearchProfile(id: string): Promise<void> {
+  await apiEnvelopeRequest<ApiEnvelope<never>>(`/search-profiles/${encodeURIComponent(id)}`, { method: 'DELETE' }, false);
 }
 
 export function createRule(rule: Pick<UIRule, 'name' | 'conditions' | 'action' | 'priority'>): Promise<UIRule> {
@@ -243,14 +347,39 @@ export interface UINotification {
   message: string;
   read: boolean;
   createdAt: string;
+  data?: { verificationId?: string; applicationId?: string; [key: string]: unknown };
+}
+
+export interface UIHumanVerification {
+  id: string;
+  applicationId: string;
+  type: string;
+  status: string;
+  prompt: string;
+  context?: unknown;
+  expiresAt: string;
+  resolvedAt?: string;
+  createdAt: string;
 }
 
 export function fetchNotifications(): Promise<UINotification[]> {
   return apiRequest<UINotification[]>('/notifications');
 }
 
+export async function markNotificationRead(id: string): Promise<void> {
+  await apiEnvelopeRequest<ApiEnvelope<never>>(`/notifications/${encodeURIComponent(id)}/read`, { method: 'PATCH' }, false);
+}
+
 export async function markAllNotificationsRead(): Promise<void> {
   await apiEnvelopeRequest<ApiEnvelope<never>>('/notifications/mark-all-read', { method: 'POST' }, false);
+}
+
+export function fetchHumanVerifications(): Promise<UIHumanVerification[]> {
+  return apiRequest<UIHumanVerification[]>('/human-verifications');
+}
+
+export async function resolveHumanVerification(id: string): Promise<void> {
+  await apiEnvelopeRequest<ApiEnvelope<never>>(`/human-verifications/${encodeURIComponent(id)}/resolve`, { method: 'POST', body: JSON.stringify({}) }, false);
 }
 
 export function fetchAutomationStatus(): Promise<AutomationRun | null> {
@@ -259,6 +388,31 @@ export function fetchAutomationStatus(): Promise<AutomationRun | null> {
 
 export function fetchAutomationEvents(): Promise<AutomationEvent[]> {
   return apiRequest<AutomationEvent[]>('/automation/events?limit=100');
+}
+
+export interface AutomationQueueMetric {
+  queue: string;
+  waiting: number;
+  oldestWaitingMs: number | null;
+  active: number;
+  delayed: number;
+  prioritized: number;
+  completed: number;
+  failed: number;
+  paused: number;
+}
+
+export interface AutomationMetrics {
+  queueMetrics: AutomationQueueMetric[] | null;
+  retryMetrics: { jobCount: number; totalAttempts: number; jobsWithRetries: number };
+  executionDuration: { sampleCount: number; averageMs: number; maxMs: number };
+  browserSessionDuration: { sampleCount: number; averageMs: number; maxMs: number };
+  pendingVerification: { pendingCount: number; oldestAgeMs: number; averageAgeMs: number; maxAgeMs: number };
+  alerts: Array<{ code: string; severity: 'WARNING' | 'CRITICAL'; message: string; value: number; threshold: number }>;
+}
+
+export function fetchAutomationMetrics(): Promise<AutomationMetrics> {
+  return apiRequest<AutomationMetrics>('/automation/metrics');
 }
 
 export async function setAutomationState(running: boolean, currentlyPaused = false): Promise<AutomationRun> {
@@ -272,11 +426,14 @@ export async function setAutomationState(running: boolean, currentlyPaused = fal
 export async function streamAutomationEvents(
   onEvent: (event: AutomationEvent) => void,
   signal: AbortSignal,
+  lastEventId?: string,
 ): Promise<void> {
   const token = getAccessToken();
   if (!token) throw new ApiError('Sign in to connect to live events.', 401);
+  const headers: Record<string, string> = { Authorization: `Bearer ${token}`, Accept: 'text/event-stream' };
+  if (typeof lastEventId === 'string' && lastEventId.trim() && lastEventId.length <= 200) headers['Last-Event-ID'] = lastEventId.trim();
   const response = await fetch(`${API_BASE}/sse/events`, {
-    headers: { Authorization: `Bearer ${token}`, Accept: 'text/event-stream' },
+    headers,
     signal,
   });
   if (!response.ok || !response.body) {
@@ -296,6 +453,7 @@ export async function streamAutomationEvents(
     const frames = buffer.split('\n\n');
     buffer = frames.pop() ?? '';
     for (const frame of frames) {
+      const frameId = frame.split('\n').find((line) => line.startsWith('id:'))?.slice(3).trim();
       const data = frame.split('\n')
         .filter((line) => line.startsWith('data:'))
         .map((line) => line.slice(5).trimStart())
@@ -305,6 +463,7 @@ export async function streamAutomationEvents(
         const parsed = JSON.parse(data) as Partial<AutomationEvent> & { type: string };
         onEvent({
           ...parsed,
+          ...(frameId && frameId.length <= 200 ? { id: frameId } : {}),
           type: parsed.type,
           timestamp: parsed.timestamp ?? new Date().toISOString(),
         });
@@ -386,6 +545,7 @@ interface RawApplication {
   id: string;
   jobId: string;
   status: string;
+  version?: number;
   matchScore?: number;
   atsScore?: number;
   appliedAt?: string;
@@ -407,6 +567,10 @@ interface RawApplicationDetail extends RawApplication {
     fieldsDetected: number;
     fieldsFilled: number;
   }>;
+  interviews?: UIInterview[];
+  offers?: OfferRecord[];
+  emailOutcomes?: UIEmailOutcome[];
+  jobs?: UIApplication['jobs'];
 }
 
 interface RawResumeVersion {
@@ -513,6 +677,7 @@ function toUIApplication(app: RawApplication): UIApplication {
     role: app.job.title,
     location: app.job.location,
     status: app.status,
+    version: app.version,
     matchScore: app.matchScore,
     atsScore: app.atsScore ?? app.resumeVersion?.atsScoreOverall,
     appliedAt: app.appliedAt,

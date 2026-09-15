@@ -1,16 +1,17 @@
 import React, { useEffect, useState } from 'react';
 import { Search, Bell, Sparkles, Command, ShieldCheck, CheckCircle2, User, LogOut } from 'lucide-react';
 import { AuthUser } from '../types';
-import { fetchNotifications, markAllNotificationsRead, UINotification } from '../services/api';
+import { fetchNotifications, markAllNotificationsRead, markNotificationRead, UINotification } from '../services/api';
 
 interface HeaderProps {
   user: AuthUser;
   onSignOut: () => void;
   onOpenCmdK: () => void;
   onOpenAIChat: () => void;
+  onOpenHumanReview: () => void;
 }
 
-export const Header: React.FC<HeaderProps> = ({ user, onSignOut, onOpenCmdK, onOpenAIChat }) => {
+export const Header: React.FC<HeaderProps> = ({ user, onSignOut, onOpenCmdK, onOpenAIChat, onOpenHumanReview }) => {
   const [showNotifications, setShowNotifications] = useState(false);
   const [notifications, setNotifications] = useState<UINotification[]>([]);
   const [notificationsLoading, setNotificationsLoading] = useState(false);
@@ -26,6 +27,15 @@ export const Header: React.FC<HeaderProps> = ({ user, onSignOut, onOpenCmdK, onO
       .finally(() => setNotificationsLoading(false));
   }, [showNotifications]);
 
+  useEffect(() => {
+    const refresh = () => {
+      void fetchNotifications().then(setNotifications).catch((error) => setNotificationError(error instanceof Error ? error.message : 'Could not refresh notifications.'));
+    };
+    refresh();
+    const timer = window.setInterval(refresh, 30_000);
+    return () => window.clearInterval(timer);
+  }, []);
+
   const markAllRead = async () => {
     setNotificationError('');
     try {
@@ -37,6 +47,21 @@ export const Header: React.FC<HeaderProps> = ({ user, onSignOut, onOpenCmdK, onO
   };
 
   const unreadCount = notifications.filter((notification) => !notification.read).length;
+  const markRead = async (id: string) => {
+    setNotificationError('');
+    try {
+      await markNotificationRead(id);
+      setNotifications((current) => current.map((notification) => notification.id === id ? { ...notification, read: true } : notification));
+    } catch (error) { setNotificationError(error instanceof Error ? error.message : 'Could not mark notification as read.'); }
+  };
+  const openNotification = async (notification: UINotification) => {
+    await markRead(notification.id);
+    const verificationId = notification.data?.verificationId;
+    if ((notification.type === 'CAPTCHA_REQUIRED' || notification.type === 'MFA_REQUIRED' || notification.type === 'HUMAN_VERIFICATION_REQUIRED')
+      && typeof verificationId === 'string' && verificationId.trim() && verificationId.length <= 200) {
+      onOpenHumanReview();
+    }
+  };
   const notificationIcon = (type: string) => {
     const normalized = type.toLowerCase();
     if (normalized.includes('fail') || normalized.includes('required') || normalized.includes('warning')) {
@@ -115,7 +140,7 @@ export const Header: React.FC<HeaderProps> = ({ user, onSignOut, onOpenCmdK, onO
                   <p className="px-2 py-4 text-center text-xs text-slate-500">No notifications.</p>
                 )}
                 {notifications.map((notification) => (
-                  <div key={notification.id} className={`p-2.5 rounded-xl border flex items-start gap-2.5 ${notification.read ? 'bg-slate-950/30 border-slate-800/40 opacity-70' : 'bg-slate-950/60 border-slate-800/60'}`}>
+                  <button type="button" key={notification.id} onClick={() => void openNotification(notification)} aria-label={notification.read ? `${notification.title}, read` : `Mark ${notification.title} as read`} className={`w-full text-left p-2.5 rounded-xl border flex items-start gap-2.5 ${notification.read ? 'bg-slate-950/30 border-slate-800/40 opacity-70' : 'bg-slate-950/60 border-slate-800/60'}`}>
                     {notificationIcon(notification.type)}
                     <div className="flex-1 min-w-0">
                       <p className="text-xs font-semibold text-white truncate">{notification.title}</p>
@@ -124,7 +149,7 @@ export const Header: React.FC<HeaderProps> = ({ user, onSignOut, onOpenCmdK, onO
                         {new Date(notification.createdAt).toLocaleString()}
                       </time>
                     </div>
-                  </div>
+                  </button>
                 ))}
               </div>
             </div>

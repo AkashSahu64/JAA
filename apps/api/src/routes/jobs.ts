@@ -4,6 +4,7 @@ import { createAutomationJob } from '../services/automation-jobs';
 import { authenticate, AuthenticatedRequest } from '../middleware/auth';
 import { isRecord, parsePagination } from '../middleware/validate';
 import { cancelDiscoveryRun, createDiscoveryRuns, getDiscoveryRun, listDiscoveryRuns } from '../services/job-discovery';
+import { logRouteError } from '../observability/structured-log';
 
 const router = Router();
 router.use(authenticate);
@@ -59,7 +60,7 @@ router.get('/', async (req: AuthenticatedRequest, res: Response) => {
       totalPages: Math.ceil(total / pageSize),
     });
   } catch (error) {
-    console.error('Job list error:', error);
+    logRouteError('jobs.list_failure', error, { correlationId: req.get('x-correlation-id'), userId: req.user?.userId });
     return res.status(500).json({ success: false, error: 'Failed to fetch jobs' });
   }
 });
@@ -97,7 +98,7 @@ router.post('/discover', async (req: AuthenticatedRequest, res: Response) => {
     if (hasErrorCode(error, 'INVALID_INPUT')) {
       return res.status(400).json({ success: false, error: error instanceof Error ? error.message : 'Invalid discovery request' });
     }
-    console.error('Discovery run creation error:', error);
+    logRouteError('jobs.discovery_creation_failure', error, { correlationId: req.get('x-correlation-id'), userId: req.user?.userId });
     return res.status(500).json({ success: false, error: 'Failed to create discovery runs' });
   }
 });
@@ -109,7 +110,7 @@ router.get('/discovery-runs', async (req: AuthenticatedRequest, res: Response) =
     if (limit === null) return res.status(400).json({ success: false, error: 'limit must be an integer between 1 and 100' });
     return res.json(discoveryRunsListed(await listDiscoveryRuns(req.user!.userId, limit)));
   } catch (error) {
-    console.error('Discovery run list error:', error);
+    logRouteError('jobs.discovery_list_failure', error, { correlationId: req.get('x-correlation-id'), userId: req.user?.userId });
     return res.status(500).json({ success: false, error: 'Failed to fetch discovery runs' });
   }
 });
@@ -122,7 +123,7 @@ router.get('/discovery-runs/:runId', async (req: AuthenticatedRequest, res: Resp
     if (!run) return res.status(404).json({ success: false, error: 'Discovery run not found' });
     return res.json(discoveryRunResult(run));
   } catch (error) {
-    console.error('Discovery run status error:', error);
+    logRouteError('jobs.discovery_status_failure', error, { correlationId: req.get('x-correlation-id'), userId: req.user?.userId });
     return res.status(500).json({ success: false, error: 'Failed to fetch discovery run' });
   }
 });
@@ -139,7 +140,7 @@ router.post('/discovery-runs/:runId/cancel', async (req: AuthenticatedRequest, r
     if (hasErrorCode(error, 'TERMINAL')) {
       return res.status(409).json({ success: false, error: error instanceof Error ? error.message : 'Discovery run is terminal' });
     }
-    console.error('Discovery run cancellation error:', error);
+    logRouteError('jobs.discovery_cancellation_failure', error, { correlationId: req.get('x-correlation-id'), userId: req.user?.userId });
     return res.status(500).json({ success: false, error: 'Failed to cancel discovery run' });
   }
 });
@@ -190,7 +191,7 @@ router.post('/:id/match', async (req: AuthenticatedRequest, res: Response) => {
     return res.status(automationJob.replayed ? 200 : 202).json({ success: true, data: { id: automationJob.id, status: automationJob.status, replayed: automationJob.replayed } });
   } catch (error) {
     if (hasErrorCode(error, 'IDEMPOTENCY_CONFLICT')) return res.status(409).json({ success: false, error: error instanceof Error ? error.message : 'Matching request conflicts with existing work' });
-    console.error('Job matching request error:', error);
+    logRouteError('jobs.match_failure', error, { correlationId: req.get('x-correlation-id'), userId: req.user?.userId, applicationId: req.params.id });
     return res.status(500).json({ success: false, error: 'Failed to queue job matching' });
   }
 });
