@@ -63,7 +63,7 @@ describeBrowser('Lever local Chromium fixtures', () => {
         page.setDefaultTimeout(3_000);
         await page.setContent(fixture.html);
         const port = new LeverPlaywrightFormPort(page) as LeverFormPort;
-        const output = await new LeverApplicationAdapter().fillCurrentStep(port, fixture.profile ?? {});
+        const output = await new LeverApplicationAdapter().fillCurrentStep(port, fixture.profile ?? {}, [], 'fixture-user');
         expect(output.filledFieldIds).toEqual(fixture.filled);
         expect(output.requiredBlockingFieldIds).toEqual(fixture.blocked ?? []);
         expect(output.assessments.some(assessment => assessment.disposition === 'HUMAN_VERIFICATION_REQUIRED')).toBe(fixture.verification ?? false);
@@ -80,7 +80,7 @@ describeBrowser('Lever local Chromium fixtures', () => {
       page.setDefaultTimeout(3_000);
       await page.setContent('<form><label for="resume">Resume</label><input id="resume" name="resume" type="file" required></form>');
       const port = new LeverPlaywrightFormPort(page) as LeverFormPort;
-      const detected = await new LeverApplicationAdapter().fillCurrentStep(port, {});
+      const detected = await new LeverApplicationAdapter().fillCurrentStep(port, {}, [], 'fixture-user');
       expect(detected.requiredBlockingFieldIds).toContain('resume');
       await port.uploadDocument!('resume', { fileName: 'approved-resume.pdf', mimeType: 'application/pdf', checksumSha256: 'a'.repeat(64), bytes: Buffer.from('%PDF-1.7 fixture') });
       expect(await page.locator('#resume').evaluate((input: HTMLInputElement) => ({ name: input.files?.[0]?.name, size: input.files?.[0]?.size })))
@@ -98,7 +98,7 @@ describeBrowser('Lever local Chromium fixtures', () => {
       await page.setContent('<form><label for="email">Email</label><input id="email" name="email" required><label for="resume">Resume</label><input id="resume" name="resume" type="file" required><button id="submit" type="button">Submit application</button></form>');
       await page.locator('#submit').evaluate(button => button.addEventListener('click', () => { document.body.innerHTML = '<h1>Application submitted</h1><p>Your application was received. Confirmation ID: lever-fixture-1234</p>'; }));
       const port = new LeverPlaywrightFormPort(page) as LeverFormPort;
-      const detected = await new LeverApplicationAdapter().fillCurrentStep(port, { email: 'ada@example.invalid' });
+      const detected = await new LeverApplicationAdapter().fillCurrentStep(port, { email: 'ada@example.invalid' }, [], 'fixture-user');
       expect(detected.filledFieldIds).toEqual(['email']);
       await port.uploadDocument!('resume', { fileName: 'approved-resume.pdf', mimeType: 'application/pdf', checksumSha256: 'a'.repeat(64), bytes: Buffer.from('%PDF-1.7 fixture') });
       await page.locator('#submit').click();
@@ -117,14 +117,57 @@ describeBrowser('Lever local Chromium fixtures', () => {
       await page.setContent('<form id="application"><label for="email">Email</label><input id="email" name="email" required></form>');
       const adapter = new LeverApplicationAdapter();
       const port = new LeverPlaywrightFormPort(page) as LeverFormPort;
-      const first = await adapter.fillCurrentStep(port, { email: 'ada@example.invalid' });
-      const second = await adapter.fillCurrentStep(port, { email: 'ada@example.invalid' });
+      const first = await adapter.fillCurrentStep(port, { email: 'ada@example.invalid' }, [], 'fixture-user');
+      const second = await adapter.fillCurrentStep(port, { email: 'ada@example.invalid' }, [], 'fixture-user');
       expect(first.filledFieldIds).toEqual(['email']);
       expect(second.filledFieldIds).toEqual(['email']);
       await page.locator('#application').evaluate(form => form.insertAdjacentHTML('beforeend', '<label for="phone">Phone</label><input id="phone" name="phone" required>'));
-      const dynamic = await adapter.fillCurrentStep(port, { phone: '+15550100' });
+      const dynamic = await adapter.fillCurrentStep(port, { phone: '+15550100' }, [], 'fixture-user');
       expect(dynamic.filledFieldIds).toEqual(['phone']);
       expect(await page.locator('#phone').inputValue()).toBe('+15550100');
+    } finally {
+      await context.close();
+    }
+  }, 30_000);
+
+  it('advances a real multi-step form and re-detects fields rendered by the next step', async () => {
+    const context = await browser.newContext();
+    try {
+      const page = await context.newPage();
+      page.setDefaultTimeout(3_000);
+      await page.setContent('<form id="application"><div data-step="1"><label for="email">Email</label><input id="email" name="email" required><button id="next" type="button">Continue</button></div></form>');
+      await page.locator('#next').evaluate(button => button.addEventListener('click', () => {
+        const form = document.querySelector('#application');
+        if (form) form.innerHTML = '<div data-step="2"><label for="portfolio">Portfolio URL</label><input id="portfolio" name="portfolio" required></div>';
+      }));
+
+      const port = new LeverPlaywrightFormPort(page) as LeverFormPort;
+      const adapter = new LeverApplicationAdapter();
+      const first = await adapter.fillCurrentStep(port, { email: 'ada@example.invalid' }, [], 'fixture-user');
+      expect(first.filledFieldIds).toEqual(['email']);
+      expect(first.requiredBlockingFieldIds).toEqual([]);
+      // The shared adapter advances a completed step exactly once.
+      expect(port.advance).toBeDefined();
+      expect((await port.snapshot()).step).toBe(2);
+      const second = await adapter.fillCurrentStep(port, { websiteUrl: 'https://example.invalid/ada' }, [], 'fixture-user');
+      expect(second.filledFieldIds).toEqual(['portfolio']);
+      expect(await page.locator('#portfolio').inputValue()).toBe('https://example.invalid/ada');
+      expect((await port.snapshot()).step).toBe(2);
+    } finally {
+      await context.close();
+    }
+  }, 30_000);
+
+  it('extracts validation errors with field identity from a real Lever DOM', async () => {
+    const context = await browser.newContext();
+    try {
+      const page = await context.newPage();
+      page.setDefaultTimeout(3_000);
+      await page.setContent('<form><label for="email">Email</label><input id="email" name="email" aria-invalid="true" aria-errormessage="email-error"><span id="email-error" class="field-error">Enter a valid email address</span></form>');
+      const port = new LeverPlaywrightFormPort(page) as LeverFormPort;
+      await expect(port.validate()).resolves.toEqual([{ fieldId: 'email', message: 'Enter a valid email address' }]);
+      const snapshot = await port.snapshot();
+      expect(snapshot.fields).toEqual([expect.objectContaining({ id: 'email', inputType: 'text' })]);
     } finally {
       await context.close();
     }

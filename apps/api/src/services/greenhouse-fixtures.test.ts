@@ -53,7 +53,7 @@ describeBrowser('Greenhouse browser fixtures', () => {
         const page = await context.newPage();
         await page.setContent(fixture.html);
         const form = new GreenhousePlaywrightFormPort(page) as GreenhouseFormPort;
-        const result = await new GreenhouseApplicationAdapter().fillCurrentStep(form, fixture.profile ?? {});
+        const result = await new GreenhouseApplicationAdapter().fillCurrentStep(form, fixture.profile ?? {}, [], 'fixture-owner');
         expect(result.filledFieldIds).toEqual(fixture.expect.filled ?? []);
         expect(result.requiredBlockingFieldIds).toEqual(fixture.expect.blocked ?? []);
         expect(result.advanced).toBe(fixture.expect.advanced ?? false);
@@ -72,8 +72,8 @@ describeBrowser('Greenhouse browser fixtures', () => {
       await page.setContent('<form><label for="email">Email</label><input id="email" name="email" required></form>');
       const adapter = new GreenhouseApplicationAdapter();
       const form = new GreenhousePlaywrightFormPort(page) as GreenhouseFormPort;
-      const first = await adapter.fillCurrentStep(form, { email: 'ada@example.invalid' });
-      const second = await adapter.fillCurrentStep(form, { email: 'ada@example.invalid' });
+      const first = await adapter.fillCurrentStep(form, { email: 'ada@example.invalid' }, [], 'fixture-owner');
+      const second = await adapter.fillCurrentStep(form, { email: 'ada@example.invalid' }, [], 'fixture-owner');
       expect(first.filledFieldIds).toEqual(['email']);
       expect(second.filledFieldIds).toEqual(['email']);
       expect(await page.locator('#email').inputValue()).toBe('ada@example.invalid');
@@ -94,7 +94,7 @@ describeBrowser('Greenhouse browser fixtures', () => {
       await page.setContent(html);
       const result = await new GreenhouseApplicationAdapter().fillCurrentStep(
         new GreenhousePlaywrightFormPort(page) as GreenhouseFormPort,
-        { email: 'ada@example.invalid' },
+        { email: 'ada@example.invalid' }, [], 'fixture-owner',
       );
       expect(result).toMatchObject({ filledFieldIds: ['email'], requiredBlockingFieldIds: [] });
     } finally {
@@ -111,7 +111,7 @@ describeBrowser('Greenhouse browser fixtures', () => {
       const adapter = new GreenhouseApplicationAdapter();
       await adapter.fillCurrentStep(form, { email: 'ada@example.invalid' });
       await page.locator('#application').evaluate(formElement => formElement.insertAdjacentHTML('beforeend', '<label for="phone">Phone</label><input id="phone" name="phone" required>'));
-      const result = await adapter.fillCurrentStep(form, { phone: '+15550100' });
+      const result = await adapter.fillCurrentStep(form, { phone: '+15550100' }, [], 'fixture-owner');
       expect(await page.locator('#phone').inputValue()).toBe('+15550100');
       expect(result.filledFieldIds).toEqual(['phone']);
     } finally {
@@ -125,11 +125,11 @@ describeBrowser('Greenhouse browser fixtures', () => {
       const page = await context.newPage();
       await page.setContent('<form><label for="email">Email</label><input id="email" name="email" required><label for="resume">Resume</label><input id="resume" name="resume" type="file" required></form>');
       const port = new GreenhousePlaywrightFormPort(page) as GreenhouseFormPort;
-      const detected = await new GreenhouseApplicationAdapter().fillCurrentStep(port, { email: 'ada@example.invalid' });
+      const detected = await new GreenhouseApplicationAdapter().fillCurrentStep(port, { email: 'ada@example.invalid' }, [], 'fixture-owner');
       const document = {
         id: 'fixture-document', userId: 'fixture-owner', kind: 'RESUME_APPROVED', resumeVersionId: 'fixture-version',
         bucket: 'private', objectKey: 'private/fixture', versionId: null, fileName: 'approved-resume.pdf',
-        mimeType: 'application/pdf' as const, checksumSha256: 'a'.repeat(64), byteSize: BigInt(12), scanStatus: 'CLEAN', deletedAt: null, expiresAt: null,
+        mimeType: 'application/pdf' as const, checksumSha256: 'a'.repeat(64), byteSize: BigInt(12), scanStatus: 'CLEAN', approvalStatus: 'APPROVED', approvedAt: new Date(), approvedBy: 'fixture-owner', deletedAt: null, expiresAt: null,
       };
       const result = await fillApprovedResumeDocument(port, detected, document, 'fixture-version', 'fixture-owner', {
         readAuthorized: async () => ({ buffer: Buffer.from('%PDF-1.7 fixture'), fileName: document.fileName, mimeType: document.mimeType }),
@@ -149,8 +149,8 @@ describeBrowser('Greenhouse browser fixtures', () => {
       await page.setContent('<form><label for="email">Email</label><input id="email" name="email" required><label for="resume">Resume</label><input id="resume" name="resume" type="file" required><button id="submit" type="button">Submit</button></form>');
       await page.locator('#submit').evaluate(button => button.addEventListener('click', () => { document.body.innerHTML = '<h1>Thanks for applying</h1><p>Application received. Application ID: gh-fixture-1234</p>'; }));
       const port = new GreenhousePlaywrightFormPort(page) as GreenhouseFormPort;
-      const detected = await new GreenhouseApplicationAdapter().fillCurrentStep(port, { email: 'ada@example.invalid' });
-      const approvedDocument = { id: 'fixture-document', userId: 'fixture-owner', kind: 'RESUME_APPROVED', resumeVersionId: 'fixture-version', bucket: 'private', objectKey: 'private/fixture', versionId: null, fileName: 'approved-resume.pdf', mimeType: 'application/pdf' as const, checksumSha256: 'a'.repeat(64), byteSize: BigInt(16), scanStatus: 'CLEAN', deletedAt: null, expiresAt: null };
+      const detected = await new GreenhouseApplicationAdapter().fillCurrentStep(port, { email: 'ada@example.invalid' }, [], 'fixture-owner');
+      const approvedDocument = { id: 'fixture-document', userId: 'fixture-owner', kind: 'RESUME_APPROVED', resumeVersionId: 'fixture-version', bucket: 'private', objectKey: 'private/fixture', versionId: null, fileName: 'approved-resume.pdf', mimeType: 'application/pdf' as const, checksumSha256: 'a'.repeat(64), byteSize: BigInt(16), scanStatus: 'CLEAN', approvalStatus: 'APPROVED', approvedAt: new Date(), approvedBy: 'fixture-owner', deletedAt: null, expiresAt: null };
       const filled = await fillApprovedResumeDocument(port, detected, approvedDocument, 'fixture-version', 'fixture-owner', { readAuthorized: async () => ({ buffer: Buffer.from('%PDF-1.7 fixture'), fileName: approvedDocument.fileName, mimeType: approvedDocument.mimeType }) });
       expect(filled.requiredBlockingFieldIds).not.toContain('resume');
       await page.locator('#submit').click();

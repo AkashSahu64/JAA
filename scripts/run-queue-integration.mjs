@@ -9,6 +9,7 @@ const env = {
   ...process.env,
   QUEUE_INTEGRATION: '1',
   SSE_REDIS_INTEGRATION: '1',
+  QUEUE_STALL_INTEGRATION: '1',
   DATABASE_URL: process.env.DATABASE_URL ?? 'postgresql://jobagent:jobagent-local@localhost:5432/jobagent',
   DATABASE_ADMIN_URL: process.env.DATABASE_ADMIN_URL ?? process.env.DATABASE_URL ?? 'postgresql://jobagent:jobagent-local@localhost:5432/jobagent',
   REDIS_URL: process.env.REDIS_URL ?? 'redis://localhost:6379',
@@ -59,7 +60,7 @@ if (!(await endpointReachable(databaseUrl.hostname, Number(databaseUrl.port || 5
 
 const result = spawnSync(
   command,
-  [vitest, 'run', 'apps/api/src/services/queue-worker.integration.test.ts', 'apps/api/src/services/sse-redis-bridge.integration.test.ts'],
+  [vitest, 'run', 'apps/api/src/services/queue-worker.integration.test.ts', 'apps/api/src/services/sse-redis-bridge.integration.test.ts', 'apps/api/src/services/queue-stall.integration.test.ts'],
   { stdio: 'inherit', env },
 );
 

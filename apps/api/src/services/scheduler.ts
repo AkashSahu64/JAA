@@ -23,10 +23,21 @@ function values(field: string, min: number, max: number): Set<number> {
   return result;
 }
 
-function cronParts(expression: string): [Set<number>, Set<number>, Set<number>, Set<number>, Set<number>] {
+function cronParts(expression: string): {
+  minutes: Set<number>; hours: Set<number>; days: Set<number>; months: Set<number>; weekdays: Set<number>;
+  dayOfMonthWildcard: boolean; weekdayWildcard: boolean;
+} {
   const parts = expression.trim().split(/\s+/);
   if (parts.length !== 5) throw new SchedulerError('Custom cron must contain five fields');
-  return [values(parts[0], 0, 59), values(parts[1], 0, 23), values(parts[2], 1, 31), values(parts[3], 1, 12), values(parts[4], 0, 6)];
+  const weekdays = values(parts[4], 0, 7);
+  // POSIX cron accepts both 0 and 7 for Sunday. Normalize the alias so the
+  // timezone formatter's Sunday=0 representation remains the only runtime form.
+  if (weekdays.has(7)) { weekdays.delete(7); weekdays.add(0); }
+  return {
+    minutes: values(parts[0], 0, 59), hours: values(parts[1], 0, 23), days: values(parts[2], 1, 31),
+    months: values(parts[3], 1, 12), weekdays,
+    dayOfMonthWildcard: parts[2] === '*', weekdayWildcard: parts[4] === '*',
+  };
 }
 
 function localParts(date: Date, timeZone: string): [number, number, number, number, number] {
@@ -60,11 +71,16 @@ export function nextScheduledRun(schedule: ScheduleName, customCron: string | nu
   const expression = schedule === 'HOURLY' ? '0 * * * *' : schedule === 'EVERY_3_HOURS' ? '0 */3 * * *'
     : schedule === 'DAILY' ? '0 0 * * *' : schedule === 'WEEKLY' ? '0 0 * * 0' : customCron;
   if (!expression) throw new SchedulerError('CUSTOM schedule requires a cron expression');
-  const [minutes, hours, days, months, weekdays] = cronParts(expression);
+  const { minutes, hours, days, months, weekdays, dayOfMonthWildcard, weekdayWildcard } = cronParts(expression);
   const candidate = new Date(from.getTime() - (from.getTime() % 60_000) + 60_000);
   for (let i = 0; i < 366 * 24 * 60; i += 1) {
     const [minute, hour, day, month, weekday] = localParts(candidate, timeZone);
-    if (minutes.has(minute) && hours.has(hour) && days.has(day) && months.has(month) && weekdays.has(weekday)) return candidate;
+    const dayMatches = dayOfMonthWildcard && weekdayWildcard
+      ? true
+      : dayOfMonthWildcard ? weekdays.has(weekday)
+        : weekdayWildcard ? days.has(day)
+          : days.has(day) || weekdays.has(weekday);
+    if (minutes.has(minute) && hours.has(hour) && months.has(month) && dayMatches) return candidate;
     candidate.setTime(candidate.getTime() + 60_000);
   }
   throw new SchedulerError('No scheduled run found within one year');

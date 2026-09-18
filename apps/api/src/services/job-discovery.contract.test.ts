@@ -275,10 +275,9 @@ describeDatabase.sequential('job discovery persistence contracts', () => {
     expect(second).toMatchObject({ jobsCreated: 0, jobsUpdated: 1, itemsDuplicate: 0, itemsFetched: 1 });
 
     const jobs = await prisma.job.findMany({
-      where: { source: 'greenhouse', sourceJobId: canonicalDiscoveryJobIdentity(account, sourceJobId) },
+      where: { source: 'GREENHOUSE', sourceJobId: canonicalDiscoveryJobIdentity(account, sourceJobId) },
     });
     expect(jobs).toHaveLength(1);
     jobs.forEach(job => jobIds.add(job.id));
   });
 });
-

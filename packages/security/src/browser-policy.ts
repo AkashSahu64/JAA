@@ -256,6 +256,21 @@ export class BrowserNavigationPolicyError extends Error {
 
 export type HumanVerificationKind = 'CAPTCHA' | 'MFA' | 'ANTI_BOT' | 'AUTH';
 
+export const HUMAN_VERIFICATION_KINDS: readonly HumanVerificationKind[] = ['CAPTCHA', 'MFA', 'ANTI_BOT', 'AUTH'];
+
+/**
+ * Runtime guard for the verification kind contract.
+ *
+ * Provider snapshots are untrusted input: a hostile page can put any value on an
+ * annotated verification control, and a TypeScript annotation does not survive the
+ * boundary. Every value that becomes a typed `HumanVerificationKind` must pass this
+ * check first, so an unrecognized string can never reach a typed field or a
+ * persisted record.
+ */
+export function isHumanVerificationKind(value: unknown): value is HumanVerificationKind {
+  return typeof value === 'string' && (HUMAN_VERIFICATION_KINDS as readonly string[]).includes(value);
+}
+
 export interface HumanVerificationClassification {
   readonly requiresHuman: true;
   readonly kind: HumanVerificationKind;

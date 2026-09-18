@@ -103,13 +103,13 @@ export async function recordInterview(input: InterviewInput) {
   if (!Number.isSafeInteger(round) || round < 1 || round > 100) throw new Error('Interview round is invalid');
   const persist = () => withTenant(input.userId, async (tx) => {
     await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`${input.userId}:interview:${input.sourceEventId ?? input.applicationId}`}, 0))`;
-    const application = await ensureStatus(tx, input, 'INTERVIEW', 'Interview recorded by explicit user/system lifecycle event', `interview:${input.userId}:${input.sourceEventId ?? input.applicationId}`);
     const db = tx as any;
     const existing = input.sourceEventId ? await db.interview.findUnique({ where: { userId_sourceEventId: { userId: input.userId, sourceEventId: input.sourceEventId } } }) : null;
     if (existing) {
       if (!sameInterviewEvent(existing, input, { type, company, role, interviewer, meetingUrl, date, round })) throw new Error('Interview source event conflicts with an existing lifecycle event');
       return existing;
     }
+    const application = await ensureStatus(tx, input, 'INTERVIEW', 'Interview recorded by explicit user/system lifecycle event', `interview:${input.userId}:${input.sourceEventId ?? input.applicationId}`);
     const interview = await db.interview.create({ data: { userId: input.userId, applicationId: application.id, date, type, company, role, round, interviewer, meetingUrl, sourceEventId: input.sourceEventId } });
     await tx.auditLog.create({ data: { userId: input.userId, action: 'INTERVIEW_RECORDED', resource: 'Interview', resourceId: interview.id, details: { applicationId: input.applicationId, sourceEventId: input.sourceEventId ?? null } } });
     return interview;
@@ -140,14 +140,12 @@ export async function recordOffer(input: OfferInput) {
   const persist = () => withTenant(input.userId, async (tx) => {
     const db = tx as any;
     await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`${input.userId}:offer:${input.sourceEventId ?? input.applicationId}`}, 0))`;
-    const application = await tx.application.findFirst({ where: { id: input.applicationId, userId: input.userId }, select: { id: true, status: true, version: true } });
-    if (!application) throw new Error('Application does not belong to tenant');
-    if (application.status !== 'OFFER') await ensureStatus(tx, input, 'OFFER', 'Offer recorded by explicit user/system lifecycle event', `offer:${input.userId}:${input.sourceEventId ?? input.applicationId}`);
     const existing = input.sourceEventId ? await db.offer.findUnique({ where: { userId_sourceEventId: { userId: input.userId, sourceEventId: input.sourceEventId } } }) : null;
     if (existing) {
       if (!sameOfferEvent(existing, input, { company, role, salaryOffered: input.salaryOffered, currency, benefits, startDate, expiresAt })) throw new Error('Offer source event conflicts with an existing lifecycle event');
       return existing;
     }
+    const application = await ensureStatus(tx, input, 'OFFER', 'Offer recorded by explicit user/system lifecycle event', `offer:${input.userId}:${input.sourceEventId ?? input.applicationId}`);
     const offer = await db.offer.create({ data: { userId: input.userId, applicationId: input.applicationId, company, role, salaryOffered: input.salaryOffered, currency, benefits, startDate, expiresAt, sourceEventId: input.sourceEventId } });
     await tx.auditLog.create({ data: { userId: input.userId, action: 'OFFER_RECORDED', resource: 'Offer', resourceId: offer.id, details: { applicationId: input.applicationId, sourceEventId: input.sourceEventId ?? null } } });
     return offer;

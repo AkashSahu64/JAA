@@ -32,6 +32,8 @@ describeDatabase.sequential('application answer approval boundary', () => {
 
   afterAll(async () => {
     await prisma.user.deleteMany({ where: { id: { in: [userId, otherUserId] } } });
+    // Jobs are not user-owned, so removing the candidate does not remove this fixture.
+    await prisma.job.deleteMany({ where: { id: jobId } });
     await prisma.$disconnect();
   });
 

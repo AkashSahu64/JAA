@@ -74,7 +74,9 @@ describeOutage.sequential('Redis outage recovery', () => {
     const token = randomUUID();
     const created = await createAutomationJob({
       userId,
-      type: 'APPLICATION_REDIS_OUTAGE_FIXTURE',
+      // A real `applications`-routed type: the worker handler is stubbed by this test, and
+      // job routing is exact-match, so an invented type would never reach this queue.
+      type: 'VERIFY_SUBMISSION_CONFIRMATION',
       payload: { token },
       correlationId: randomUUID(),
       idempotencyKey: `goal5-outage:${token}`,

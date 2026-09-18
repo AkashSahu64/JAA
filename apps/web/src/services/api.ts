@@ -20,7 +20,7 @@ import {
   UISearchProfile,
 } from '../types';
 
-const API_BASE = '/api';
+const API_BASE = (import.meta.env.VITE_API_BASE_URL || '/api').replace(/\/+$/, '');
 const TOKEN_KEY = 'jobagent.accessToken';
 const REFRESH_TOKEN_KEY = 'jobagent.refreshToken';
 const USER_KEY = 'jobagent.user';
@@ -243,6 +243,20 @@ export function fetchEmailConnections(): Promise<UIEmailConnection[]> {
   return apiRequest<UIEmailConnection[]>('/email-connections');
 }
 
+export function startEmailOAuth(provider: 'GMAIL' | 'MICROSOFT_GRAPH', accountLabel: string, scopes: string[], redirectUri: string): Promise<{ authorizationUrl: string; stateId: string; expiresAt: string }> {
+  return apiRequest<{ authorizationUrl: string; stateId: string; expiresAt: string }>('/email-connections/oauth/start', {
+    method: 'POST',
+    body: JSON.stringify({ provider, accountLabel, scopes, redirectUri }),
+  });
+}
+
+export function syncEmailConnection(connectionId: string): Promise<{ id: string; status: string; replayed: boolean }> {
+  return apiRequest<{ id: string; status: string; replayed: boolean }>(`/email-connections/${encodeURIComponent(connectionId)}/sync`, {
+    method: 'POST',
+    headers: { 'Idempotency-Key': crypto.randomUUID() },
+  });
+}
+
 export async function revokeEmailConnection(connectionId: string): Promise<void> {
   await apiEnvelopeRequest<ApiEnvelope<never>>(`/email-connections/${encodeURIComponent(connectionId)}`, { method: 'DELETE' }, false);
 }
@@ -268,6 +282,19 @@ export function authorizeSubmission(applicationId: string, expectedVersion: numb
     method: 'POST',
     headers: { 'Idempotency-Key': crypto.randomUUID() },
     body: JSON.stringify({ expectedVersion, correlationId }),
+  });
+}
+
+export function markApplicationReadyForSubmission(applicationId: string, expectedVersion: number): Promise<UIApplication> {
+  return apiRequest<UIApplication>(`/applications/${encodeURIComponent(applicationId)}/status`, {
+    method: 'PATCH',
+    body: JSON.stringify({
+      status: 'READY_TO_SUBMIT', expectedVersion,
+      reason: 'User reviewed the completed provider form and marked it ready for explicit submission authorization',
+      idempotencyKey: `dashboard-ready-to-submit:${applicationId}:${expectedVersion}`,
+      correlationId: `dashboard-ready-to-submit:${applicationId}`,
+      metadata: { reviewedByUser: true },
+    }),
   });
 }
 
@@ -366,6 +393,17 @@ export function fetchNotifications(): Promise<UINotification[]> {
   return apiRequest<UINotification[]>('/notifications');
 }
 
+export interface UINotificationPage {
+  notifications: UINotification[];
+  nextCursor: string | null;
+}
+
+export async function fetchNotificationPage(before?: string): Promise<UINotificationPage> {
+  const query = before ? `?before=${encodeURIComponent(before)}` : '';
+  const response = await apiEnvelopeRequest<ApiEnvelope<UINotification[]> & { nextCursor?: string | null }>(`/notifications${query}`);
+  return { notifications: response.data ?? [], nextCursor: response.nextCursor ?? null };
+}
+
 export async function markNotificationRead(id: string): Promise<void> {
   await apiEnvelopeRequest<ApiEnvelope<never>>(`/notifications/${encodeURIComponent(id)}/read`, { method: 'PATCH' }, false);
 }
@@ -445,6 +483,8 @@ export async function streamAutomationEvents(
   const decoder = new TextDecoder();
   let buffer = '';
   let streamDone = false;
+  const safeEventType = (value: unknown): value is string => typeof value === 'string' && Boolean(value.trim())
+    && value.length <= 200 && !Array.from(value).some((character) => character.charCodeAt(0) < 32 || character.charCodeAt(0) === 127);
   while (!streamDone) {
     const { value, done } = await reader.read();
     streamDone = done;
@@ -454,6 +494,7 @@ export async function streamAutomationEvents(
     buffer = frames.pop() ?? '';
     for (const frame of frames) {
       const frameId = frame.split('\n').find((line) => line.startsWith('id:'))?.slice(3).trim();
+      const frameType = frame.split('\n').find((line) => line.startsWith('event:'))?.slice(6).trim();
       const data = frame.split('\n')
         .filter((line) => line.startsWith('data:'))
         .map((line) => line.slice(5).trimStart())
@@ -461,10 +502,15 @@ export async function streamAutomationEvents(
       if (!data) continue;
       try {
         const parsed = JSON.parse(data) as Partial<AutomationEvent> & { type: string };
+        const eventType = safeEventType(parsed.type)
+          ? parsed.type.trim()
+          : typeof frameType === 'string' && frameType.length <= 200 && !Array.from(frameType).some((character) => character.charCodeAt(0) < 32 || character.charCodeAt(0) === 127)
+            ? frameType : undefined;
+        if (!eventType) continue;
         onEvent({
           ...parsed,
           ...(frameId && frameId.length <= 200 ? { id: frameId } : {}),
-          type: parsed.type,
+          type: eventType,
           timestamp: parsed.timestamp ?? new Date().toISOString(),
         });
       } catch {

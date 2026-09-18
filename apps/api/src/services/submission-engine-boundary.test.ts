@@ -24,8 +24,32 @@ describe('submission answer approval boundary', () => {
     expect(() => validateProviderExecutionResult({
       provider: 'GREENHOUSE',
       attemptedAt: new Date(),
-      confirmation: { applicationId: 'application-1', provider: 'GREENHOUSE', observedAt: new Date() },
+      confirmation: {
+        applicationId: 'application-1', provider: 'GREENHOUSE', confirmationId: 'gh-1234',
+        evidenceHash: 'a'.repeat(64), parserVersion: 'fixture-parser/1.0.0',
+        observedAt: new Date(), source: 'APPLICATION_ID',
+      },
     }, 'application-1')).not.toThrow();
+  });
+
+  it('rejects a provider outcome that does not match the authorized provider', () => {
+    expect(() => validateProviderExecutionResult({
+      provider: 'LEVER', attemptedAt: new Date(),
+    }, 'application-1', 'GREENHOUSE')).toThrow('mismatched outcome');
+  });
+
+  it('rejects confirmation evidence that is missing its immutable verifier fields', () => {
+    expect(() => validateProviderExecutionResult({
+      provider: 'GREENHOUSE', attemptedAt: new Date(), confirmation: {
+        applicationId: 'application-1', provider: 'GREENHOUSE', observedAt: new Date(),
+      },
+    }, 'application-1')).toThrow('unverifiable confirmation evidence');
+  });
+
+  it('rejects provider timestamps that predate the authorized execution window', () => {
+    const now = new Date('2026-09-16T00:00:00.000Z');
+    expect(() => validateProviderExecutionResult({ provider: 'GREENHOUSE', attemptedAt: new Date('2026-09-15T23:00:00.000Z') }, 'application-1', 'GREENHOUSE', now))
+      .toThrow('unverifiable outcome');
   });
 
   it('accepts only an owner-approved answer with a valid approval timestamp', () => {
@@ -33,6 +57,7 @@ describe('submission answer approval boundary', () => {
     expect(isReviewedApplicationAnswer({ ...base, approvedBy: 'other-user' }, 'user-1')).toBe(false);
     expect(isReviewedApplicationAnswer({ ...base, userId: 'other-user' }, 'user-1')).toBe(false);
     expect(isReviewedApplicationAnswer({ ...base, approvedAt: null }, 'user-1')).toBe(false);
+    expect(isReviewedApplicationAnswer({ ...base, approvedAt: new Date(Number.NaN) }, 'user-1')).toBe(false);
     expect(isReviewedApplicationAnswer({ ...base, provenance: { source: 'AI_SUGGESTION' } }, 'user-1')).toBe(false);
   });
 

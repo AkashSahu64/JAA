@@ -47,6 +47,8 @@ describe('notification outbox consumer', () => {
     ['CONFIRMED', 'APPLICATION_SUBMITTED', 'Application confirmed'],
     ['ASSESSMENT', 'ASSESSMENT_DETECTED', 'Assessment detected'],
     ['FAILED', 'APPLICATION_FAILED', 'Application needs attention'],
+    ['REJECTED', 'APPLICATION_REJECTED', 'Application update'],
+    ['WITHDRAWN', 'APPLICATION_WITHDRAWN', 'Application withdrawn'],
     ['INTERVIEW', 'INTERVIEW_DETECTED', 'Interview detected'],
     ['OFFER', 'OFFER_DETECTED', 'Offer detected'],
   ])('maps %s lifecycle transitions to durable notification data', (toStatus, type, title) => {
@@ -128,6 +130,17 @@ describe('notification outbox consumer', () => {
     expect(mapOutboxEventToNotification(event({ eventType: 'application.run.scheduled', payload: { applicationId: 'application-1' } }))).toBeNull();
   });
 
+  it('maps operational alerts to durable notification data', () => {
+    expect(mapOutboxEventToNotification(event({
+      aggregateType: 'AutomationOperations', aggregateId: 'user-1', eventType: 'automation.alert',
+      payload: { code: 'QUEUE_FAILURES', severity: 'CRITICAL', message: 'Queue contains failed work', value: 2, threshold: 1 },
+    }))).toMatchObject({
+      type: 'OPERATIONAL_ALERT', title: 'Automation alert: QUEUE_FAILURES', message: 'Queue contains failed work',
+      data: { code: 'QUEUE_FAILURES', severity: 'CRITICAL', value: 2, threshold: 1 },
+    });
+    expect(mapOutboxEventToNotification(event({ aggregateType: 'AutomationOperations', eventType: 'automation.alert', payload: { code: 'QUEUE_FAILURES' } }))).toBeNull();
+  });
+
   it('maps classified email outcomes to a durable review notification without changing lifecycle state', () => {
     expect(mapOutboxEventToNotification(event({
       aggregateType: 'EmailOutcome', aggregateId: 'email-outcome-1', eventType: 'email.outcome.detected',
@@ -160,6 +173,7 @@ describe('notification outbox consumer', () => {
   it.each([
     { aggregateId: 42 as never },
     { correlationId: '' },
+    { correlationId: 'correlation\nlog-forgery' },
     { idempotencyKey: 'x'.repeat(301) },
     { occurredAt: 'not-a-date' as never },
     { userId: 42 as never },

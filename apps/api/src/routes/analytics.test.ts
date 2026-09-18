@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { analyticsStatusPolicy, averageElapsedHours, classifyAtsScore, groupApplicationsByDateAndStatus, parseAnalyticsDays, summarizeInterviewRounds, summarizeOfferOutcomes } from './analytics';
+import { analyticsStatusPolicy, applicationTimelineRows, averageElapsedHours, classifyAtsScore, groupApplicationsByDateAndStatus, parseAnalyticsDays, summarizeInterviewRounds, summarizeOfferOutcomes } from './analytics';
 
 describe('analytics funnel aggregation', () => {
   it('counts terminal and positive lifecycle outcomes as responses', () => {
@@ -66,5 +66,11 @@ describe('analytics funnel aggregation', () => {
   it('aggregates durable interview rounds and offer outcomes without trusting malformed rows', () => {
     expect(summarizeInterviewRounds([{ round: 1 }, { round: 2 }, { round: 2 }, { round: 0 }, { round: 101 }, { round: Number.NaN }])).toEqual({ total: 3, highestRound: 2, byRound: { '1': 1, '2': 2 } });
     expect(summarizeOfferOutcomes([{ status: 'PENDING' }, { status: 'ACCEPTED' }, { status: 'ACCEPTED' }, { status: 'bad status' }, { status: '' }])).toEqual({ total: 3, byStatus: { PENDING: 1, ACCEPTED: 2 } });
+  });
+
+  it('returns timeline buckets chronologically independent of database page order', () => {
+    expect(applicationTimelineRows({ '2026-09-15': 1, '2026-09-13': 2, '2026-09-14': 3 })).toEqual([
+      { date: '2026-09-13', count: 2 }, { date: '2026-09-14', count: 3 }, { date: '2026-09-15', count: 1 },
+    ]);
   });
 });

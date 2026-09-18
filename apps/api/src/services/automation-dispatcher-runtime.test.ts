@@ -44,7 +44,8 @@ describe('AutomationDispatcherRuntime', () => {
   it('validates interval and batch configuration', () => {
     expect(() => new AutomationDispatcherRuntime({ intervalMs: 0 })).toThrow('intervalMs must be a positive integer');
     expect(() => new AutomationDispatcherRuntime({ batchSize: 1.5 })).toThrow('batchSize must be a positive integer');
-    expect(() => new AutomationDispatcherRuntime({ shutdownTimeoutMs: 999 })).toThrow('Dispatcher shutdown timeout must be at least one second');
+    expect(() => new AutomationDispatcherRuntime({ shutdownTimeoutMs: 999 })).toThrow('Dispatcher shutdown timeout must be between one second and two minutes');
+    expect(() => new AutomationDispatcherRuntime({ shutdownTimeoutMs: 120_001 })).toThrow('between one second and two minutes');
   });
 
   it('reconciles before dispatch and shares an overlapping pass', async () => {

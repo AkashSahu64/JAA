@@ -3,6 +3,17 @@ import { withTenant } from '@jobagent/database';
 export const EMAIL_PROVIDERS = ['GMAIL', 'MICROSOFT_GRAPH', 'IMAP'] as const;
 export type EmailProvider = typeof EMAIL_PROVIDERS[number];
 
+export const APPROVED_EMAIL_SCOPES: Record<Exclude<EmailProvider, 'IMAP'>, ReadonlySet<string>> = {
+  GMAIL: new Set(['https://www.googleapis.com/auth/gmail.readonly', 'openid', 'email', 'profile']),
+  MICROSOFT_GRAPH: new Set(['Mail.Read', 'openid', 'email', 'profile', 'offline_access', 'User.Read']),
+};
+
+export function validateApprovedEmailScopes(provider: EmailProvider, scopes: readonly string[]): void {
+  if (provider !== 'IMAP' && (scopes.length === 0 || scopes.some(scope => !APPROVED_EMAIL_SCOPES[provider].has(scope)))) {
+    throw new Error('Email scopes exceed the approved read-mail permission set');
+  }
+}
+
 export interface GrantEmailConsentInput {
   userId: string;
   provider: EmailProvider;
@@ -25,6 +36,7 @@ export function validateEmailConsentInput(input: GrantEmailConsentInput): void {
   if (!EMAIL_PROVIDERS.includes(input.provider)) throw new Error('Unsupported email provider');
   bounded(input.accountLabel, 'Account label', 320);
   if (!Array.isArray(input.scopes) || input.scopes.length > 50 || input.scopes.some(scope => typeof scope !== 'string' || !scope.trim() || scope.length > 200 || Array.from(scope).some(character => character.charCodeAt(0) < 32 || character.charCodeAt(0) === 127))) throw new Error('Invalid email scopes');
+  validateApprovedEmailScopes(input.provider, input.scopes);
   if (input.credentialRef !== undefined && (Array.from(input.credentialRef).some(character => character.charCodeAt(0) < 32 || character.charCodeAt(0) === 127) || !/^[A-Za-z0-9._:-]{1,200}$/.test(input.credentialRef.trim()))) throw new Error('Credential reference must be an opaque reference');
 }
 

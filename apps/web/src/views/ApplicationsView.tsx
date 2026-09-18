@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { AlertTriangle } from 'lucide-react';
-import { applyEmailOutcome, authorizeSubmission, cancelAutomationJob, decideOffer, fetchApplication, fetchApplications, recordInterview, recordOffer, reviewEmailOutcome, scheduleApplicationRun } from '../services/api';
+import { applyEmailOutcome, authorizeSubmission, cancelAutomationJob, decideOffer, fetchApplication, fetchApplications, markApplicationReadyForSubmission, recordInterview, recordOffer, reviewEmailOutcome, scheduleApplicationRun } from '../services/api';
 import { UIApplication } from '../types';
 
 export const ApplicationsView: React.FC = () => {
@@ -14,6 +14,7 @@ export const ApplicationsView: React.FC = () => {
   const [emailBusyId, setEmailBusyId] = useState<string | null>(null);
   const [lifecycleBusy, setLifecycleBusy] = useState<'INTERVIEW' | 'OFFER' | null>(null);
   const [submissionBusy, setSubmissionBusy] = useState(false);
+  const [readyBusy, setReadyBusy] = useState(false);
   const [scheduleBusy, setScheduleBusy] = useState(false);
   const [scheduleDate, setScheduleDate] = useState('');
   const [cancelBusyId, setCancelBusyId] = useState<string | null>(null);
@@ -122,6 +123,17 @@ export const ApplicationsView: React.FC = () => {
     } catch (cause) { setError(cause instanceof Error ? cause.message : 'Could not authorize submission.'); }
     finally { setSubmissionBusy(false); }
   };
+  const markSelectedApplicationReady = async () => {
+    if (!selectedApp?.version) return;
+    setReadyBusy(true);
+    setError('');
+    try {
+      const refreshed = await markApplicationReadyForSubmission(selectedApp.id, selectedApp.version);
+      setSelectedApp(refreshed);
+      setApps((current) => current.map((app) => app.id === refreshed.id ? { ...app, status: refreshed.status, version: refreshed.version } : app));
+    } catch (cause) { setError(cause instanceof Error ? cause.message : 'Could not mark the application ready for submission.'); }
+    finally { setReadyBusy(false); }
+  };
   const scheduleSelectedRun = async () => {
     if (!selectedApp || !scheduleDate) return;
     setScheduleBusy(true);
@@ -157,6 +169,7 @@ export const ApplicationsView: React.FC = () => {
       <div className="lg:col-span-7 space-y-3">{filteredApps.map((app) => <button type="button" key={app.id} onClick={() => selectApp(app)} aria-pressed={selectedApp?.id === app.id} className={`w-full p-4 rounded-2xl border text-left ${selectedApp?.id === app.id ? 'bg-slate-900 border-indigo-500/60' : 'bg-slate-900/60 border-slate-800/80 hover:border-slate-700'}`}><div className="flex justify-between gap-3"><div><span className="font-semibold text-xs text-indigo-400">{app.company}</span><h3 className="font-bold text-base text-white">{app.role}</h3><p className="text-[11px] text-slate-400 font-mono">Applied: {date(app.appliedAt)}</p></div><div className="text-right"><StatusBadge status={app.status} /><p className="mt-2 text-[10px] text-slate-400 font-mono">Match: {app.matchScore === undefined ? '—' : `${Math.round(app.matchScore)}%`} · ATS: {app.atsScore === undefined ? '—' : `${Math.round(app.atsScore)}%`}</p></div></div></button>)}</div>
       <div className="lg:col-span-5">{selectedApp && <div className="p-5 rounded-2xl bg-slate-900 border border-slate-800 space-y-5 sticky top-24"><div className="space-y-1 border-b border-slate-800 pb-4"><div className="flex justify-between"><span className="text-xs font-semibold text-indigo-400">{selectedApp.company}</span><StatusBadge status={selectedApp.status} /></div><h2 className="font-bold text-lg text-white">{selectedApp.role}</h2>{selectedApp.location && <p className="text-xs text-slate-400">{selectedApp.location}</p>}</div>
         {selectedApp.failureReason && <div className="p-3 rounded-xl bg-amber-500/10 border border-amber-500/30 text-xs text-amber-300"><div className="font-semibold flex gap-1"><AlertTriangle className="w-4 h-4" />Failure details</div><p>{selectedApp.failureReason}</p></div>}
+        {selectedApp.status === 'FORM_FILLED' && selectedApp.version && <div className="rounded-xl border border-amber-500/30 bg-amber-500/10 p-3 text-xs text-amber-200"><p className="font-semibold">Review completed form</p><p className="mt-1 text-amber-300/80">Confirm the persisted answers and documents are correct before moving this application to the explicit submission-authorization gate.</p><button type="button" disabled={readyBusy} onClick={() => void markSelectedApplicationReady()} className="mt-3 rounded-lg bg-amber-600 px-3 py-1.5 text-[11px] font-semibold text-white disabled:opacity-50">{readyBusy ? 'Saving review…' : 'Mark ready to submit'}</button></div>}
         {selectedApp.status === 'READY_TO_SUBMIT' && selectedApp.version && <div className="rounded-xl border border-amber-500/30 bg-amber-500/10 p-3 text-xs text-amber-200"><p className="font-semibold">Explicit submission approval required</p><p className="mt-1 text-amber-300/80">This authorizes the worker to submit the exact approved application documents. CAPTCHA, MFA, and authentication challenges still pause for human verification.</p><button type="button" disabled={submissionBusy} onClick={() => void authorizeSelectedSubmission()} className="mt-3 rounded-lg bg-amber-600 px-3 py-1.5 text-[11px] font-semibold text-white disabled:opacity-50">{submissionBusy ? 'Authorizing…' : 'Authorize submission'}</button></div>}
         {selectedApp.status === 'APPLICATION_STARTED' && <div className="rounded-xl border border-indigo-500/30 bg-indigo-500/10 p-3 text-xs text-indigo-200"><p className="font-semibold">Schedule provider form run</p><p className="mt-1 text-indigo-300/80">The run is persisted and will respect automation pause/resume state. Human verification remains required when the provider requests it.</p><div className="mt-3 flex gap-2"><input type="datetime-local" value={scheduleDate} onChange={(event) => setScheduleDate(event.target.value)} aria-label="Application run time" className="min-w-0 flex-1 rounded-lg bg-slate-900 border border-slate-800 px-2 py-1.5 text-xs text-white" /><button type="button" disabled={scheduleBusy || !scheduleDate} onClick={() => void scheduleSelectedRun()} className="rounded-lg bg-indigo-600 px-3 py-1.5 text-[11px] font-semibold text-white disabled:opacity-50">{scheduleBusy ? 'Scheduling…' : 'Schedule'}</button></div></div>}
         {selectedApp.jobs?.length ? <div className="space-y-2"><h4 className="text-xs font-bold text-slate-400 uppercase font-mono">Durable provider runs</h4>{selectedApp.jobs.map((job) => <div key={job.id} className="rounded-xl border border-slate-800 bg-slate-950 p-3 text-xs"><div className="flex justify-between gap-2"><span className="font-semibold text-white">{job.type.replace('COMPLETE_', '').replace('_APPLICATION', '')}</span><span className="text-indigo-300">{job.status}</span></div><p className="mt-1 text-slate-500">Due: {date(job.availableAt)} · Attempts: {job.attemptCount}</p>{job.lastError && <p className="mt-1 text-rose-300">{job.lastError}</p>}{['PENDING', 'AVAILABLE'].includes(job.status) && <button type="button" disabled={cancelBusyId === job.id} onClick={() => void cancelSelectedRun(job.id)} className="mt-2 rounded-lg bg-slate-800 px-2.5 py-1.5 text-[11px] font-semibold text-slate-200 disabled:opacity-50">{cancelBusyId === job.id ? 'Cancelling…' : 'Cancel run'}</button>}</div>)}</div> : null}

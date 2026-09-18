@@ -99,6 +99,26 @@ describe('LeverPlaywrightFormPort', () => {
     });
   });
 
+  it('detects an ARIA-only combobox using its accessible name as semantic identity', async () => {
+    const controls = [{
+      tagName: 'DIV', type: '', name: '', id: '', required: false,
+      getAttribute: vi.fn((name: string) => name === 'role' ? 'combobox' : name === 'aria-label' ? 'Department' : null),
+      closest: vi.fn(() => null),
+    }];
+    const fields = { evaluateAll: vi.fn(async (mapper: (elements: typeof controls) => unknown) => {
+      const originalDocument = globalThis.document;
+      Object.defineProperty(globalThis, 'document', { value: { querySelector: () => null, getElementById: () => null, querySelectorAll: () => [] }, configurable: true });
+      try { return mapper(controls); } finally { Object.defineProperty(globalThis, 'document', { value: originalDocument, configurable: true }); }
+    }) };
+    const step = { first: vi.fn(() => ({ getAttribute: vi.fn(async () => null) })) };
+    page.locator.mockImplementation((selector: string) => selector.includes('input[name]') ? fields
+      : selector.includes('[data-step]') ? step : { count: vi.fn(async () => 0) });
+
+    await expect(new LeverPlaywrightFormPort(page as never).snapshot()).resolves.toMatchObject({
+      fields: [expect.objectContaining({ id: 'Department', name: 'Department', accessibleName: 'Department', kind: 'COMBOBOX' })],
+    });
+  });
+
   it('marks hidden dynamic controls so shared intelligence can fail closed', async () => {
     const controls = [{
       tagName: 'INPUT', type: 'text', name: 'conditional', id: 'conditional', required: false,

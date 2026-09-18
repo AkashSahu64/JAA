@@ -31,7 +31,11 @@ function jobInput(userId: string, overrides: Partial<Parameters<typeof createAut
   const token = randomUUID();
   return {
     userId,
-    type: 'APPLICATION_FIXTURE',
+    // This fixture supplies its own worker handler, so the type only has to route to the
+    // `applications` queue. It is a real routed type rather than an invented one: job
+    // routing is an exact-match table, so a made-up type would be quarantined on
+    // `maintenance` and never reach the queue under test.
+    type: 'VERIFY_SUBMISSION_CONFIRMATION',
     payload: { token },
     correlationId: randomUUID(),
     idempotencyKey: `goal5:${token}`,

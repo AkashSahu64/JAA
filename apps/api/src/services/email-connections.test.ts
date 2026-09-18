@@ -17,7 +17,7 @@ vi.mock('@jobagent/database', () => ({
 import { grantEmailConsent, validateEmailConsentInput } from './email-connections';
 
 describe('email consent boundary', () => {
-  const valid = { userId: 'tenant-a', provider: 'GMAIL' as const, accountLabel: 'candidate@example.test', scopes: ['readonly'], credentialRef: 'vault:credential-1' };
+  const valid = { userId: 'tenant-a', provider: 'GMAIL' as const, accountLabel: 'candidate@example.test', scopes: ['https://www.googleapis.com/auth/gmail.readonly'], credentialRef: 'vault:credential-1' };
   it('accepts bounded provider consent with an opaque credential reference', () => {
     expect(() => validateEmailConsentInput(valid)).not.toThrow();
   });
@@ -27,6 +27,11 @@ describe('email consent boundary', () => {
   it('rejects unsupported providers and invalid scopes', () => {
     expect(() => validateEmailConsentInput({ ...valid, provider: 'OUTLOOK' as never })).toThrow('Unsupported');
     expect(() => validateEmailConsentInput({ ...valid, scopes: [''] })).toThrow('scopes');
+  });
+  it('rejects broad or unknown direct-consent scopes for each OAuth provider', () => {
+    expect(() => validateEmailConsentInput({ ...valid, scopes: ['https://mail.google.com/'] })).toThrow('approved read-mail');
+    expect(() => validateEmailConsentInput({ ...valid, provider: 'MICROSOFT_GRAPH', scopes: ['Mail.ReadWrite'] })).toThrow('approved read-mail');
+    expect(() => validateEmailConsentInput({ ...valid, provider: 'MICROSOFT_GRAPH', scopes: ['Mail.Read', 'Calendars.Read'] })).toThrow('approved read-mail');
   });
   it('rejects malformed consent objects without leaking a runtime TypeError', () => {
     expect(() => validateEmailConsentInput(undefined as never)).toThrow('consent input is invalid');

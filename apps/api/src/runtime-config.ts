@@ -27,6 +27,30 @@ export function validateRuntimeConfiguration(env: NodeJS.ProcessEnv = process.en
   validateProductionDatabaseUrl(env.DATABASE_URL!);
   validateProductionRedisUrl(env.REDIS_URL!);
   if (env.S3_ENDPOINT?.trim()) validateProductionS3Endpoint(env.S3_ENDPOINT);
+  if (env.OAUTH_ALLOWED_REDIRECT_ORIGINS?.trim()) validateProductionOAuthRedirectOrigins(env.OAUTH_ALLOWED_REDIRECT_ORIGINS);
+  if (env.OTEL_EXPORTER_OTLP_TRACES_ENDPOINT?.trim()) validateProductionTelemetryEndpoint(env.OTEL_EXPORTER_OTLP_TRACES_ENDPOINT);
+}
+
+export function validateProductionTelemetryEndpoint(value: string): void {
+  try {
+    const endpoint = new URL(value);
+    if (endpoint.protocol !== 'https:' || endpoint.username || endpoint.password || endpoint.search || endpoint.hash) throw new Error('unsafe');
+  } catch {
+    throw new Error('OTEL_EXPORTER_OTLP_TRACES_ENDPOINT must be an HTTPS endpoint without embedded credentials or fragments in production');
+  }
+}
+
+export function validateProductionOAuthRedirectOrigins(value: string): void {
+  const origins = value.split(',').map(origin => origin.trim()).filter(Boolean);
+  if (origins.length === 0 || origins.length > 20) throw new Error('OAUTH_ALLOWED_REDIRECT_ORIGINS must contain 1-20 origins');
+  for (const origin of origins) {
+    try {
+      const url = new URL(origin);
+      if (url.protocol !== 'https:' || url.username || url.password || url.pathname !== '/' || url.search || url.hash || url.origin !== origin) throw new Error('unsafe');
+    } catch {
+      throw new Error('OAUTH_ALLOWED_REDIRECT_ORIGINS must contain HTTPS origins only');
+    }
+  }
 }
 
 export function validateProductionS3Endpoint(value: string): void {

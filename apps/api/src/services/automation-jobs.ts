@@ -1,6 +1,8 @@
 import { Prisma, JobStatus, type AutomationJob } from '@prisma/client';
-import { withService, withTenant } from '@jobagent/database';
+import { withService, withTenant, type TenantTransaction } from '@jobagent/database';
 import { safeErrorMessage } from '../observability/structured-log';
+
+const MAX_AUTOMATION_ATTEMPTS = 100;
 
 export interface CreateAutomationJobInput {
   userId: string;
@@ -83,16 +85,38 @@ function positiveInteger(value: number, name: string): void {
   if (!Number.isSafeInteger(value) || value <= 0) throw new AutomationJobError('INVALID_INPUT', `${name} must be a positive integer`);
 }
 
+export function validateAutomationJobMaxAttempts(value: number): void {
+  positiveInteger(value, 'maxAttempts');
+  if (value > MAX_AUTOMATION_ATTEMPTS) {
+    throw new AutomationJobError('INVALID_INPUT', `maxAttempts must not exceed ${MAX_AUTOMATION_ATTEMPTS}`);
+  }
+}
+
 export function validateAutomationJobNow(value: Date): Date {
   if (!(value instanceof Date) || !Number.isFinite(value.getTime())) throw new AutomationJobError('INVALID_INPUT', 'now must be a valid Date');
   return value;
 }
 
+function canonicalJson(value: Prisma.JsonValue | Prisma.InputJsonValue): unknown {
+  if (Array.isArray(value)) return value.map(item => canonicalJson(item));
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, item]) => [key, canonicalJson(item)]));
+  }
+  return value;
+}
+
 function payloadEquals(left: Prisma.JsonValue, right: Prisma.InputJsonValue): boolean {
-  return JSON.stringify(left) === JSON.stringify(right);
+  return JSON.stringify(canonicalJson(left)) === JSON.stringify(canonicalJson(right));
 }
 
 export async function createAutomationJob(input: CreateAutomationJobInput): Promise<AutomationJob & { replayed: boolean }> {
+  return withTenant(input.userId, tx => createAutomationJobInTransaction(tx, input));
+}
+
+/** Create or replay a job inside a caller-owned tenant transaction. */
+export async function createAutomationJobInTransaction(tx: TenantTransaction, input: CreateAutomationJobInput): Promise<AutomationJob & { replayed: boolean }> {
   requireText(input.userId, 'userId');
   requireText(input.type, 'type');
   requireText(input.correlationId, 'correlationId');
@@ -102,9 +126,9 @@ export async function createAutomationJob(input: CreateAutomationJobInput): Prom
   const maxAttempts = input.maxAttempts ?? 3;
   if (!Number.isSafeInteger(priority)) throw new AutomationJobError('INVALID_INPUT', 'priority must be an integer');
   positiveInteger(payloadVersion, 'payloadVersion');
-  positiveInteger(maxAttempts, 'maxAttempts');
+  validateAutomationJobMaxAttempts(maxAttempts);
 
-  return withTenant(input.userId, async (tx) => {
+  return (async () => {
     await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${input.idempotencyKey}, 0))`;
     if (input.automationRunId) {
       const run = await tx.automationRun.findFirst({ where: { id: input.automationRunId, userId: input.userId }, select: { id: true } });
@@ -112,17 +136,19 @@ export async function createAutomationJob(input: CreateAutomationJobInput): Prom
     }
     const existing = await tx.automationJob.findFirst({ where: { userId: input.userId, idempotencyKey: input.idempotencyKey } });
     if (existing) {
-      const matches = existing.userId === input.userId
-        && existing.type === input.type
-        && existing.applicationId === (input.applicationId ?? null)
-        && existing.automationRunId === (input.automationRunId ?? null)
-        && existing.priority === priority
-        && existing.payloadVersion === payloadVersion
-        && existing.maxAttempts === maxAttempts
-        && existing.correlationId === input.correlationId
-        && existing.requestedAvailableAt?.getTime() === input.availableAt?.getTime()
-        && payloadEquals(existing.payload, input.payload);
-      if (!matches) throw new AutomationJobError('IDEMPOTENCY_CONFLICT', 'Idempotency key was used for a different automation job');
+      const mismatches = [
+        existing.userId !== input.userId && 'userId',
+        existing.type !== input.type && 'type',
+        existing.applicationId !== (input.applicationId ?? null) && 'applicationId',
+        existing.automationRunId !== (input.automationRunId ?? null) && 'automationRunId',
+        existing.priority !== priority && 'priority',
+        existing.payloadVersion !== payloadVersion && 'payloadVersion',
+        existing.maxAttempts !== maxAttempts && 'maxAttempts',
+        existing.correlationId !== input.correlationId && 'correlationId',
+        existing.requestedAvailableAt?.getTime() !== input.availableAt?.getTime() && 'requestedAvailableAt',
+        !payloadEquals(existing.payload, input.payload) && 'payload',
+      ].filter((field): field is string => Boolean(field));
+      if (mismatches.length) throw new AutomationJobError('IDEMPOTENCY_CONFLICT', `Idempotency key was used for a different automation job (${mismatches.join(',')})`);
       return { ...existing, replayed: true };
     }
     const job = await tx.automationJob.create({
@@ -143,7 +169,7 @@ export async function createAutomationJob(input: CreateAutomationJobInput): Prom
       },
     });
     return { ...job, replayed: false };
-  });
+  })();
 }
 
 export interface ValidateAutomationJobRetryInput {
@@ -382,7 +408,7 @@ export async function replayDeadLetterAutomationJob(input: ReplayAutomationJobIn
   requireText(input.reason, 'reason');
   requireText(input.correlationId, 'correlationId');
   const maxAttempts = input.maxAttempts ?? 3;
-  positiveInteger(maxAttempts, 'maxAttempts');
+  validateAutomationJobMaxAttempts(maxAttempts);
 
   return withTenant(input.userId, async (tx) => {
     await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`automation-job-replay:${input.jobId}`}, 0))`;

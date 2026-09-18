@@ -5,6 +5,7 @@ import { ProviderApplicationService, type ExecuteProviderApplicationInput } from
 import { LeverPlaywrightFormPort } from './lever-form-port';
 
 type BrowserSessionPort = ConstructorParameters<typeof ProviderApplicationService>[0];
+type DocumentStoragePort = ConstructorParameters<typeof ProviderApplicationService>[2];
 type LeverFormPortFactory = (page: Page) => LeverFormPort;
 
 export type ExecuteLeverApplicationInput = Omit<ExecuteProviderApplicationInput, 'provider'>;
@@ -19,10 +20,15 @@ export class LeverApplicationService {
   constructor(
     browserSessions?: BrowserSessionPort,
     formPort: LeverFormPortFactory = page => new LeverPlaywrightFormPort(page),
+    // Accepted for the same reason the Greenhouse entry point accepts it: without it the
+    // storage boundary is unsubstitutable here, so the Lever path cannot be exercised
+    // against a controlled object store the way the Greenhouse path is.
+    documentStorage?: DocumentStoragePort,
   ) {
     this.service = new ProviderApplicationService(
       browserSessions,
       page => formPort(page),
+      documentStorage,
     );
   }
 

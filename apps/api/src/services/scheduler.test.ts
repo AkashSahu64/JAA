@@ -1,10 +1,10 @@
 import { describe, expect, it, vi } from 'vitest';
 import { nextScheduledRun, SchedulerError } from './scheduler';
-import { claimDueSearchSchedules, parseDiscoveryAccounts, runDueSearchSchedules, scheduleApplicationRun, validateApplicationRunAt } from './durable-scheduler';
+import { claimDueEmailSyncs, claimDueSearchSchedules, parseDiscoveryAccounts, runDueSearchSchedules, scheduleApplicationRun, validateApplicationRunAt } from './durable-scheduler';
 
 const schedulerDatabase = vi.hoisted(() => ({ withService: vi.fn(), withTenant: vi.fn(), outboxEvent: { upsert: vi.fn() } }));
 vi.mock('@jobagent/database', () => schedulerDatabase);
-const automationJobs = vi.hoisted(() => ({ createAutomationJob: vi.fn(async (input: unknown) => ({ id: 'automation-1', status: 'AVAILABLE', availableAt: new Date('2026-01-01T01:00:00Z'), replayed: false, input })) }));
+const automationJobs = vi.hoisted(() => ({ createAutomationJobInTransaction: vi.fn(async (_tx: unknown, input: unknown) => ({ id: 'automation-1', status: 'AVAILABLE', availableAt: new Date('2026-01-01T01:00:00Z'), replayed: false, input })) }));
 vi.mock('./automation-jobs', () => automationJobs);
 
 describe('durable scheduler kernel', () => {
@@ -29,6 +29,16 @@ describe('durable scheduler kernel', () => {
   it('supports custom cron and IANA timezone matching', () => {
     expect(nextScheduledRun('CUSTOM', '30 9 * * 1-5', new Date('2026-01-02T15:00:00Z'), 'America/New_York'))
       .toEqual(new Date('2026-01-05T14:30:00Z'));
+  });
+
+  it('uses standard cron OR semantics when day-of-month and weekday are both restricted', () => {
+    expect(nextScheduledRun('CUSTOM', '0 9 1 * 1', new Date('2026-01-01T10:00:00Z'), 'UTC'))
+      .toEqual(new Date('2026-01-05T09:00:00Z'));
+  });
+
+  it('accepts the standard weekday 7 alias for Sunday', () => {
+    expect(nextScheduledRun('CUSTOM', '0 9 * * 7', new Date('2026-01-02T10:00:00Z'), 'UTC'))
+      .toEqual(new Date('2026-01-04T09:00:00Z'));
   });
 
   it.each(['', '* * * *', '60 * * * *', '0 0 0 * *'])('rejects invalid cron %s', expression => {
@@ -68,7 +78,7 @@ describe('durable scheduler kernel', () => {
       userId: 'user-1', applicationId: 'application-1', runAt: new Date('2026-01-01T01:00:00Z'),
       correlationId: 'corr-1', idempotencyKey: 'schedule-1',
     }, new Date('2026-01-01T00:00:00Z'))).resolves.toMatchObject({ id: 'automation-1', replayed: false });
-    expect(automationJobs.createAutomationJob).toHaveBeenCalledWith(expect.objectContaining({
+    expect(automationJobs.createAutomationJobInTransaction).toHaveBeenCalledWith(tx, expect.objectContaining({
       type: 'COMPLETE_LEVER_APPLICATION', applicationId: 'application-1', availableAt: new Date('2026-01-01T01:00:00Z'),
     }));
     expect(tx.outboxEvent.upsert).toHaveBeenCalledWith(expect.objectContaining({
@@ -88,23 +98,28 @@ describe('durable scheduler kernel', () => {
 
   it('binds scheduled work to a paused owner run so dispatcher pause/resume remains durable', async () => {
     schedulerDatabase.withTenant.mockReset();
-    schedulerDatabase.withTenant.mockResolvedValueOnce({ id: 'application-1', status: 'APPLICATION_STARTED', job: { source: 'GREENHOUSE' }, automationRun: { id: 'run-1', status: 'PAUSED' } });
-    schedulerDatabase.withTenant.mockResolvedValueOnce(undefined);
+    const tx = {
+      application: { findFirst: vi.fn(async () => ({ id: 'application-1', status: 'APPLICATION_STARTED', job: { source: 'GREENHOUSE' }, automationRun: { id: 'run-1', status: 'PAUSED' } })) },
+      auditLog: { create: vi.fn() },
+      outboxEvent: { upsert: vi.fn() },
+    };
+    schedulerDatabase.withTenant.mockImplementationOnce(async (_userId, callback) => callback(tx as never));
     await expect(scheduleApplicationRun({
       userId: 'user-1', applicationId: 'application-1', automationRunId: 'run-1', runAt: new Date('2026-01-01T01:00:00Z'),
       correlationId: 'corr-2', idempotencyKey: 'schedule-3',
     }, new Date('2026-01-01T00:00:00Z'))).resolves.toMatchObject({ id: 'automation-1' });
-    expect(automationJobs.createAutomationJob).toHaveBeenLastCalledWith(expect.objectContaining({ automationRunId: 'run-1', type: 'COMPLETE_GREENHOUSE_APPLICATION' }));
+    expect(automationJobs.createAutomationJobInTransaction).toHaveBeenLastCalledWith(expect.anything(), expect.objectContaining({ automationRunId: 'run-1', type: 'COMPLETE_GREENHOUSE_APPLICATION' }));
   });
 
   it.each(['FORM_FILLED', 'WAITING_FOR_USER'])('does not schedule a provider run from the %s checkpoint', async status => {
     schedulerDatabase.withTenant.mockReset();
-    schedulerDatabase.withTenant.mockResolvedValueOnce({ id: 'application-1', status, job: { source: 'LEVER' }, automationRun: null });
+    const tx = { application: { findFirst: vi.fn(async () => ({ id: 'application-1', status, job: { source: 'LEVER' }, automationRun: null })) } };
+    schedulerDatabase.withTenant.mockImplementationOnce(async (_userId, callback) => callback(tx as never));
     await expect(scheduleApplicationRun({
       userId: 'user-1', applicationId: 'application-1', runAt: new Date('2026-01-01T01:00:00Z'),
       correlationId: 'corr-3', idempotencyKey: `schedule-invalid-${status}`,
     }, new Date('2026-01-01T00:00:00Z'))).rejects.toThrow('not eligible');
-    expect(automationJobs.createAutomationJob).not.toHaveBeenCalledWith(expect.objectContaining({ applicationId: 'application-1', idempotencyKey: `schedule-invalid-${status}` }));
+    expect(automationJobs.createAutomationJobInTransaction).not.toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ applicationId: 'application-1', idempotencyKey: `schedule-invalid-${status}` }));
   });
 
   it('rejects invalid durable scheduler time before database access', async () => {
@@ -122,9 +137,46 @@ describe('durable scheduler kernel', () => {
     expect(schedulerDatabase.withService).toHaveBeenCalledOnce();
   });
 
+  it('preserves all tenant claims while batching scheduler fan-out', async () => {
+    schedulerDatabase.withService.mockResolvedValueOnce(Array.from({ length: 17 }, (_, index) => ({ id: `user-${index}` })));
+    const claims: string[] = [];
+    let active = 0;
+    let maximumActive = 0;
+    schedulerDatabase.withTenant.mockImplementation(async (userId: string) => {
+      claims.push(userId);
+      active += 1;
+      maximumActive = Math.max(maximumActive, active);
+      await new Promise(resolve => setTimeout(resolve, 2));
+      active -= 1;
+      return [];
+    });
+    await expect(runDueSearchSchedules(new Date('2026-01-01T00:00:00Z'))).resolves.toEqual([]);
+    expect(claims).toHaveLength(17);
+    expect(new Set(claims).size).toBe(17);
+    expect(maximumActive).toBeLessThanOrEqual(8);
+  });
+
   it('does not silently swallow malformed per-user claim inputs', async () => {
     await expect(claimDueSearchSchedules(' ', new Date())).rejects.toThrow('Scheduler user');
     await expect(claimDueSearchSchedules('user\n-1', new Date())).rejects.toThrow('Scheduler user');
     await expect(claimDueSearchSchedules('user-1', new Date(), 0)).rejects.toThrow('Scheduler limit');
+  });
+
+  it('uses a durable mailbox claim lease across scheduler interval boundaries', async () => {
+    const firstNow = new Date('2026-01-01T00:00:00Z');
+    const connection = { id: 'connection-1', provider: 'GMAIL', lastSyncAt: null as Date | null, syncClaimedAt: null as Date | null };
+    const tx = {
+      $executeRaw: vi.fn(async () => 0),
+      emailConnection: {
+        findMany: vi.fn(async () => [connection]),
+        findFirst: vi.fn(async () => connection),
+        update: vi.fn(async ({ data }: { data: { syncClaimedAt: Date } }) => { connection.syncClaimedAt = data.syncClaimedAt; return connection; }),
+      },
+      auditLog: { create: vi.fn() },
+    };
+    schedulerDatabase.withTenant.mockImplementation(async (_userId, callback) => callback(tx as never));
+    await expect(claimDueEmailSyncs('user-1', firstNow)).resolves.toHaveLength(1);
+    await expect(claimDueEmailSyncs('user-1', new Date(firstNow.getTime() + 16 * 60 * 1000))).resolves.toHaveLength(0);
+    expect(tx.emailConnection.update).toHaveBeenCalledWith(expect.objectContaining({ data: { syncClaimedAt: firstNow } }));
   });
 });

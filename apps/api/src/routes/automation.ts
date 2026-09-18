@@ -6,6 +6,8 @@ import { parseLimit, validateBody } from '../middleware/validate';
 import { cancelAutomationJob, replayDeadLetterAutomationJob } from '../services/automation-jobs';
 import { collectApplicationQueueMetrics } from '../services/queue-metrics';
 import { logRouteError } from '../observability/structured-log';
+import { persistAutomationAlerts } from '../services/automation-alert-outbox';
+import { normalizeCorrelationId } from '../middleware/request-logger';
 
 const router = Router();
 router.use(authenticate);
@@ -40,7 +42,7 @@ export function summarizePendingVerificationAges(records: readonly { createdAt: 
 }
 
 export interface AutomationOperationalAlert {
-  code: 'QUEUE_BACKLOG' | 'QUEUE_FAILURES' | 'JOB_RETRIES' | 'HUMAN_VERIFICATION_AGING' | 'BROWSER_SESSIONS_ACTIVE';
+  code: 'QUEUE_METRICS_UNAVAILABLE' | 'QUEUE_BACKLOG' | 'QUEUE_FAILURES' | 'JOB_RETRIES' | 'HUMAN_VERIFICATION_AGING' | 'BROWSER_SESSIONS_ACTIVE';
   severity: 'WARNING' | 'CRITICAL';
   message: string;
   value: number;
@@ -54,6 +56,7 @@ export function deriveAutomationAlerts(input: {
   pendingVerification: { pendingCount: number; oldestAgeMs: number };
 }): AutomationOperationalAlert[] {
   const alerts: AutomationOperationalAlert[] = [];
+  if (input.queueMetrics === null) alerts.push({ code: 'QUEUE_METRICS_UNAVAILABLE', severity: 'WARNING', message: 'Transient queue metrics are unavailable; PostgreSQL-backed metrics remain available', value: 1, threshold: 1 });
   const waiting = input.queueMetrics?.reduce((sum, queue) => sum + queue.waiting, 0) ?? 0;
   const oldestWaitingMs = input.queueMetrics?.reduce<number | null>((oldest, queue) => oldest === null ? queue.oldestWaitingMs : queue.oldestWaitingMs === null ? oldest : Math.max(oldest, queue.oldestWaitingMs), null) ?? null;
   const failed = input.queueMetrics?.reduce((sum, queue) => sum + queue.failed, 0) ?? 0;
@@ -252,6 +255,8 @@ router.get('/metrics', async (_req: AuthenticatedRequest, res: Response) => {
     const jobCount = jobRetryGroups.reduce((sum, group) => sum + group._count._all, 0);
     const jobsWithRetries = jobRetryGroups.filter(group => group.attemptCount > 1).reduce((sum, group) => sum + group._count._all, 0);
     const pendingVerificationSummary = summarizePendingVerificationAges(pendingVerifications);
+    const alerts = deriveAutomationAlerts({ queueMetrics, retryMetrics: { jobsWithRetries }, browserSessions, pendingVerification: pendingVerificationSummary });
+    await persistAutomationAlerts(userId, alerts, normalizeCorrelationId(_req.get('x-correlation-id')));
     return res.json({ success: true, data: {
       jobs, attempts, failures, browserSessions,
       queueMetrics,
@@ -259,7 +264,7 @@ router.get('/metrics', async (_req: AuthenticatedRequest, res: Response) => {
       executionDuration: summarizeExecutionDurations(attemptDurations),
       browserSessionDuration: summarizeExecutionDurations(browserSessionDurations.map(session => ({ startedAt: session.createdAt, completedAt: session.closedAt }))),
       pendingVerification: pendingVerificationSummary,
-      alerts: deriveAutomationAlerts({ queueMetrics, retryMetrics: { jobsWithRetries }, browserSessions, pendingVerification: pendingVerificationSummary }),
+      alerts,
     } });
   } catch (error) {
     logRouteError('automation.metrics_failure', error, { correlationId: _req.get('x-correlation-id'), userId: _req.user?.userId });

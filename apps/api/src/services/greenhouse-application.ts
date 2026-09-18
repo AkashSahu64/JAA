@@ -3,6 +3,7 @@ import { withTenant } from '@jobagent/database';
 import {
   GreenhouseApplicationAdapter,
   LeverApplicationAdapter,
+  advanceStepIfComplete,
   greenhouseApplicationHost,
   leverApplicationHost,
   stableQuestionIdentity,
@@ -248,8 +249,8 @@ export async function fillApprovedResumeDocument(
   }
   if (document.userId !== ownerId
     || !['RESUME_SOURCE', 'RESUME_APPROVED', 'RESUME_TAILORED'].includes(document.kind)
-    || (document.approvalStatus !== undefined && document.approvalStatus !== 'APPROVED')
-    || (document.approvalStatus === 'APPROVED' && (!document.approvedAt || document.approvedBy !== ownerId))
+    || document.approvalStatus !== 'APPROVED'
+    || !(document.approvedAt instanceof Date) || !Number.isFinite(document.approvedAt.getTime()) || document.approvedBy !== ownerId
     || document.scanStatus !== 'CLEAN' || document.deletedAt || (document.expiresAt && document.expiresAt <= new Date())
     || document.resumeVersionId !== expectedResumeVersionId) {
     return result;
@@ -283,8 +284,8 @@ export async function fillApprovedCoverLetterDocument(
     return { ...result, requiredBlockingFieldIds: [...new Set([...result.requiredBlockingFieldIds, ...fieldIds])] };
   }
   if (document.userId !== ownerId || (expectedResumeVersionId !== undefined && document.resumeVersionId !== expectedResumeVersionId)
-    || document.kind !== 'COVER_LETTER' || (document.approvalStatus !== undefined && document.approvalStatus !== 'APPROVED')
-    || (document.approvalStatus === 'APPROVED' && (!document.approvedAt || document.approvedBy !== ownerId))
+    || document.kind !== 'COVER_LETTER' || document.approvalStatus !== 'APPROVED'
+    || !(document.approvedAt instanceof Date) || !Number.isFinite(document.approvedAt.getTime()) || document.approvedBy !== ownerId
     || document.scanStatus !== 'CLEAN' || document.deletedAt
     || (document.expiresAt && document.expiresAt <= new Date())) return result;
   const file = await storage.readAuthorized(ownerId, document);
@@ -611,7 +612,10 @@ export class ProviderApplicationService {
           const greenhousePort = port as GreenhouseFormPort;
           const withDocument = await fillApprovedResumeDocument(greenhousePort, initial, prepared.document, prepared.resumeVersionId, input.userId, this.documentStorage);
           const withCoverLetterDocument = await fillApprovedCoverLetterDocument(greenhousePort, withDocument, prepared.coverLetterDocument, input.userId, this.documentStorage, prepared.resumeVersionId);
-          const result = await fillSupplementaryText(greenhousePort, withCoverLetterDocument, prepared.coverLetter);
+          // The adapter decided completeness before these systems ran; a required resume
+          // upload would otherwise strand the step loop on the first step forever.
+          const withSupplementaryText = await fillSupplementaryText(greenhousePort, withCoverLetterDocument, prepared.coverLetter);
+          const result = await advanceStepIfComplete(port, withSupplementaryText);
           completed.push(result);
           if (!result.hasNextStep || needsReview(result, prepared.coverLetter)) break;
           if (!result.advanced) break;

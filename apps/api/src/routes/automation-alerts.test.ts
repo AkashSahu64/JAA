@@ -15,12 +15,15 @@ describe('automation operational alerts', () => {
     expect(alerts.find(alert => alert.code === 'QUEUE_FAILURES')).toMatchObject({ severity: 'CRITICAL', value: 2 });
   });
 
-  it('does not emit alerts for healthy or unavailable queue metrics', () => {
+  it('emits a bounded degradation alert when queue metrics are unavailable', () => {
     expect(deriveAutomationAlerts({
       queueMetrics: null,
       retryMetrics: { jobsWithRetries: 0 },
       browserSessions: [],
       pendingVerification: { pendingCount: 0, oldestAgeMs: 0 },
-    })).toEqual([]);
+    })).toEqual([{
+      code: 'QUEUE_METRICS_UNAVAILABLE', severity: 'WARNING',
+      message: 'Transient queue metrics are unavailable; PostgreSQL-backed metrics remain available', value: 1, threshold: 1,
+    }]);
   });
 });

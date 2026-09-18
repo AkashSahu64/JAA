@@ -28,7 +28,7 @@ describe('LeverApplicationAdapter', () => {
       fields: [{ id: 'email', name: 'email', label: 'Email', kind: 'TEXT', required: true }],
     });
 
-    await expect(new LeverApplicationAdapter().fillCurrentStep(form, { email: 'ada@example.invalid' }))
+    await expect(new LeverApplicationAdapter().fillCurrentStep(form, { email: 'ada@example.invalid' }, [], 'fixture-owner'))
       .resolves.toMatchObject({ filledFieldIds: ['email'], advanced: true });
     expect(form.fill).toHaveBeenCalledWith('email', 'ada@example.invalid');
     expect(form.advance).toHaveBeenCalledOnce();

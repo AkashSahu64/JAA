@@ -13,7 +13,10 @@ const transitions: Record<ApplicationStatus, readonly ApplicationStatus[]> = {
   FORM_FILLED: ['WAITING_FOR_USER', 'READY_TO_SUBMIT', 'RETRY_PENDING', 'FAILED', 'WITHDRAWN'],
   WAITING_FOR_USER: ['FORM_FILLED', 'READY_TO_SUBMIT', 'FAILED', 'WITHDRAWN'],
   READY_TO_SUBMIT: ['SUBMISSION_PENDING', 'WAITING_FOR_USER', 'FAILED', 'WITHDRAWN'],
-  SUBMISSION_PENDING: ['WAITING_FOR_USER', 'UNCONFIRMED', 'RETRY_PENDING', 'FAILED'],
+  // An explicit authorization can expire before the worker claims it. In that
+  // case no provider side effect occurred, so the application may safely
+  // return to the authorization gate for a fresh owner decision.
+  SUBMISSION_PENDING: ['READY_TO_SUBMIT', 'WAITING_FOR_USER', 'UNCONFIRMED', 'RETRY_PENDING', 'FAILED'],
   SUBMITTED: ['UNCONFIRMED'],
   UNCONFIRMED: ['CONFIRMED', 'RETRY_PENDING', 'FAILED'],
   CONFIRMED: ['ASSESSMENT', 'INTERVIEW', 'REJECTED', 'OFFER', 'WITHDRAWN'],
@@ -77,6 +80,14 @@ function validateInput(input: TransitionApplicationInput): void {
   }
 }
 
+/** Compare JSON metadata by value, not by the insertion order of object keys. */
+function canonicalJson(value: unknown): string {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(item => canonicalJson(item)).join(',')}]`;
+  const object = value as Record<string, unknown>;
+  return `{${Object.keys(object).sort().map(key => `${JSON.stringify(key)}:${canonicalJson(object[key])}`).join(',')}}`;
+}
+
 async function findReplay(tx: TenantTransaction, input: TransitionApplicationInput) {
   const transition = await tx.applicationStatusTransition.findFirst({ where: { userId: input.userId, idempotencyKey: input.idempotencyKey } });
   if (!transition) return null;
@@ -88,7 +99,7 @@ async function findReplay(tx: TenantTransaction, input: TransitionApplicationInp
     || transition.actorId !== (input.actorId ?? null)
     || transition.reason !== input.reason
     || transition.correlationId !== input.correlationId
-    || JSON.stringify(transition.metadata) !== JSON.stringify(input.metadata ?? null)) {
+    || canonicalJson(transition.metadata) !== canonicalJson(input.metadata ?? null)) {
     throw new ApplicationTransitionError('IDEMPOTENCY_CONFLICT', 'Idempotency key was already used for a different transition');
   }
   const application = await tx.application.findFirst({ where: { id: input.applicationId, userId: input.userId } });

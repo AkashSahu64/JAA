@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { applyEmailOutcome, authorizeSubmission, cancelAutomationJob, createSearchProfile, decideResumeFact, deleteSearchProfile, fetchApplication, fetchApplicationFunnel, fetchAutomationMetrics, fetchEmailConnections, fetchNotifications, fetchResumeFacts, fetchResumes, fetchSearchProfiles, markAllNotificationsRead, markNotificationRead, recordInterview, recordOffer, revokeEmailConnection, scheduleApplicationRun, setSearchProfileActive, streamAutomationEvents } from './api';
+import { applyEmailOutcome, authorizeSubmission, cancelAutomationJob, createSearchProfile, decideResumeFact, deleteSearchProfile, fetchApplication, fetchApplicationFunnel, fetchAutomationMetrics, fetchEmailConnections, fetchNotificationPage, fetchNotifications, fetchResumeFacts, fetchResumes, fetchSearchProfiles, markAllNotificationsRead, markNotificationRead, recordInterview, recordOffer, revokeEmailConnection, scheduleApplicationRun, setSearchProfileActive, startEmailOAuth, streamAutomationEvents, syncEmailConnection } from './api';
 
 class MemoryStorage implements Storage {
   private readonly values = new Map<string, string>();
@@ -65,6 +65,22 @@ describe('notification API integration', () => {
     expect(events).toEqual([{ type: 'connected', timestamp: expect.any(String) }]);
   });
 
+  it('uses the SSE event name when a protocol frame omits data.type', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response('event: connected\ndata: {"replayed":0}\n\n', { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
+    const events: unknown[] = [];
+    await streamAutomationEvents((event) => events.push(event), new AbortController().signal);
+    expect(events).toEqual([{ replayed: 0, type: 'connected', timestamp: expect.any(String) }]);
+  });
+
+  it('rejects an unsafe data event type and falls back to the safe protocol name', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response('event: notification\ndata: {"type":"bad\\nvalue","message":"ignored type"}\n\n', { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
+    const events: unknown[] = [];
+    await streamAutomationEvents((event) => events.push(event), new AbortController().signal);
+    expect(events).toEqual([{ type: 'notification', message: 'ignored type', timestamp: expect.any(String) }]);
+  });
+
   it('loads durable and queue automation metrics without collapsing unavailable queues to zero', async () => {
     const metrics = { queueMetrics: null, retryMetrics: { jobCount: 2, totalAttempts: 3, jobsWithRetries: 1 }, executionDuration: { sampleCount: 1, averageMs: 120, maxMs: 120 }, browserSessionDuration: { sampleCount: 1, averageMs: 80, maxMs: 80 }, pendingVerification: { pendingCount: 1, oldestAgeMs: 60_000, averageAgeMs: 60_000, maxAgeMs: 60_000 } };
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify({ success: true, data: metrics }), { status: 200, headers: { 'Content-Type': 'application/json' } })));
@@ -76,6 +92,24 @@ describe('notification API integration', () => {
     vi.stubGlobal('fetch', fetchMock);
     await expect(fetchApplicationFunnel(30)).resolves.toEqual([{ date: '2026-09-14', total: 2, statuses: { READY: 1, INTERVIEW: 1 } }]);
     expect(fetchMock.mock.calls[0]?.[0]).toBe('/api/analytics/applications-funnel?days=30');
+  });
+
+  it('queues an authenticated email connection sync with an idempotency key', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ success: true, data: { id: 'job-1', status: 'AVAILABLE', replayed: false } }), { status: 202, headers: { 'Content-Type': 'application/json' } }));
+    vi.stubGlobal('fetch', fetchMock);
+    await expect(syncEmailConnection('connection-1')).resolves.toEqual({ id: 'job-1', status: 'AVAILABLE', replayed: false });
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(fetchMock.mock.calls[0]?.[0]).toBe('/api/email-connections/connection-1/sync');
+    expect(new Headers(init.headers).get('Idempotency-Key')).toMatch(/^[0-9a-f-]{36}$/);
+  });
+
+  it('starts provider OAuth through the backend-issued authorization URL', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ success: true, data: { authorizationUrl: 'https://accounts.example/authorize', stateId: 'state-1', expiresAt: '2026-09-16T00:00:00.000Z' } }), { status: 201, headers: { 'Content-Type': 'application/json' } }));
+    vi.stubGlobal('fetch', fetchMock);
+    await expect(startEmailOAuth('GMAIL', 'candidate@example.test', ['https://www.googleapis.com/auth/gmail.readonly'], 'https://app.example/api/email-connections/oauth/callback')).resolves.toMatchObject({ stateId: 'state-1' });
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(fetchMock.mock.calls[0]?.[0]).toBe('/api/email-connections/oauth/start');
+    expect(JSON.parse(String(init.body))).toMatchObject({ provider: 'GMAIL', accountLabel: 'candidate@example.test', redirectUri: expect.stringContaining('/api/email-connections/oauth/callback') });
   });
 
   it('loads authenticated notifications from the production endpoint', async () => {
@@ -98,6 +132,17 @@ describe('notification API integration', () => {
     const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(url).toBe('/api/notifications');
     expect(new Headers(init.headers).get('Authorization')).toBe('Bearer test-token');
+  });
+
+  it('loads an older notification page through the opaque cursor', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      success: true,
+      data: [],
+      nextCursor: 'older-cursor',
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } }));
+    vi.stubGlobal('fetch', fetchMock);
+    await expect(fetchNotificationPage('cursor with spaces')).resolves.toEqual({ notifications: [], nextCursor: 'older-cursor' });
+    expect(fetchMock.mock.calls[0]?.[0]).toBe('/api/notifications?before=cursor%20with%20spaces');
   });
 
   it('marks all notifications read through the backend', async () => {

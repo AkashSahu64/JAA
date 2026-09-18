@@ -10,6 +10,12 @@ const clients = new Map<string, LiveClient[]>();
 const MAX_PENDING_EVENTS = 1_000;
 const MAX_EVENT_BYTES = 100_000;
 export const MAX_SSE_CONNECTIONS_PER_USER = 10;
+export const SSE_RESPONSE_HEADERS = {
+  'Content-Type': 'text/event-stream',
+  'Cache-Control': 'no-store, no-cache, no-transform',
+  Connection: 'keep-alive',
+  'X-Accel-Buffering': 'no',
+} as const;
 
 export function hasSseCapacity(currentConnections: number, maxConnections = MAX_SSE_CONNECTIONS_PER_USER): boolean {
   return Number.isSafeInteger(currentConnections) && currentConnections >= 0
@@ -49,6 +55,21 @@ export function deduplicateReplayedEvents(replayedIds: ReadonlySet<string>, pend
   return result;
 }
 
+export function shouldPruneSseClient(writableEnded: unknown): boolean {
+  return writableEnded === true;
+}
+
+/** Keep a broken client from turning a heartbeat write into an uncaught process error. */
+export function writeSseHeartbeat(response: Pick<Response, 'write' | 'writableEnded'>): boolean {
+  if (response.writableEnded) return false;
+  try {
+    response.write(': heartbeat\n\n');
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function removeClient(userId: string, client: LiveClient): void {
   const remaining = (clients.get(userId) || []).filter(candidate => candidate !== client);
   if (remaining.length) clients.set(userId, remaining);
@@ -62,12 +83,7 @@ router.get('/events', authenticate, (req: AuthenticatedRequest, res: Response) =
     return res.status(429).json({ success: false, error: 'Too many live event connections' });
   }
   
-  res.writeHead(200, {
-    'Content-Type': 'text/event-stream',
-    'Cache-Control': 'no-cache, no-transform',
-    Connection: 'keep-alive',
-    'X-Accel-Buffering': 'no',
-  });
+  res.writeHead(200, SSE_RESPONSE_HEADERS);
   res.flushHeaders();
   
   const writeEvent = (id: string | undefined, type: string, data: unknown) => {
@@ -93,6 +109,7 @@ router.get('/events', authenticate, (req: AuthenticatedRequest, res: Response) =
 
   // Replay durable notifications before registering live delivery. The cursor
   // is resolved only inside this tenant's notification scope.
+  let replayFailed = false;
   void (async () => {
     try {
       const notifications = await withTenant(userId, async tx => {
@@ -115,17 +132,29 @@ router.get('/events', authenticate, (req: AuthenticatedRequest, res: Response) =
       const pending = deduplicateReplayedEvents(replayedIds, client.pending.splice(0));
       for (const event of pending) writeEvent(event.id, event.type, event.data);
     } catch {
-      writeEvent(undefined, 'connected', { timestamp: new Date().toISOString(), replayed: 0, replayUnavailable: true });
+      // A live-only stream is unsafe: notifications committed during a replay
+      // failure could be missed across reconnects. Close the stream and let the
+      // client retry with its Last-Event-ID once durable replay is available.
+      replayFailed = true;
+      client.pending.length = 0;
+      writeEvent(undefined, 'error', { code: 'REPLAY_UNAVAILABLE', retryable: true });
+      res.end();
+      removeClient(userId, client);
     } finally {
       client.replaying = false;
-      const pending = client.pending.splice(0);
-      for (const event of pending) writeEvent(event.id, event.type, event.data);
+      if (!replayFailed) {
+        const pending = client.pending.splice(0);
+        for (const event of pending) writeEvent(event.id, event.type, event.data);
+      }
     }
   })();
   
   // Heartbeat
   const heartbeat = setInterval(() => {
-    if (!res.writableEnded) res.write(`: heartbeat\n\n`);
+    if (!writeSseHeartbeat(res)) {
+      if (!res.writableEnded) res.end();
+      removeClient(userId, client);
+    }
   }, 30000);
   
   // Cleanup on close
@@ -155,7 +184,10 @@ export function broadcastToUser(userId: string, event: { id?: string; type: stri
         client.pending.push(event);
         continue;
       }
-      if (client.response.writableEnded) continue;
+      if (shouldPruneSseClient(client.response.writableEnded)) {
+        removeClient(userId, client);
+        continue;
+      }
       const serialized = serializeSseData(event.data);
       if (!serialized) {
         client.response.end();

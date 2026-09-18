@@ -3,6 +3,7 @@ export type StructuredLogLevel = 'info' | 'error' | 'warn';
 export interface StructuredLogRecord {
   event: string;
   correlationId?: string;
+  traceId?: string;
   applicationId?: string;
   automationJobId?: string;
   provider?: string;
@@ -14,21 +15,31 @@ const MAX_STRING_LENGTH = 1_000;
 const MAX_KEYS = 40;
 const MAX_ARRAY_ITEMS = 20;
 const MAX_DEPTH = 3;
-const SENSITIVE_KEY = /(?:password|secret|token|credential|cookie|authorization|apiKey|accessKey|privateKey|pageText|body|answer|resume|coverLetter|documentContent)/i;
-const TRACE_KEYS = new Set(['correlationId', 'applicationId', 'automationJobId', 'provider', 'userId']);
+const SENSITIVE_KEY = /(?:password|secret|token|credential|cookie|authorization|apiKey|accessKey|privateKey|pageText|body|answer|resume|coverLetter|documentContent|email|phone|address|dateOfBirth|socialSecurity|ssn)/i;
+const TRACE_KEYS = new Set(['correlationId', 'traceId', 'applicationId', 'automationJobId', 'provider', 'userId']);
 const SAFE_TRACE_VALUE = /^[A-Za-z0-9._:-]{1,128}$/;
 const SAFE_EVENT_VALUE = /^[A-Za-z0-9._:-]{1,128}$/;
 const NON_NEGATIVE_METRIC_KEYS = new Set(['durationMs', 'retryDelayMs', 'providerRetryAfterMs']);
 
+function safeString(value: unknown): string {
+  try {
+    return String(value);
+  } catch {
+    return '[UNSERIALIZABLE]';
+  }
+}
+
 export function redactSensitiveMessage(message: string): string {
   return message
     .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]+/giu, 'Bearer [REDACTED]')
+    .replace(/\bBasic\s+[A-Za-z0-9+/=]+/giu, 'Basic [REDACTED]')
+    .replace(/\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/giu, '[REDACTED_JWT]')
     .replace(/(\b(?:password|passphrase|secret|token|credential|api[_-]?key|access[_-]?token|refresh[_-]?token)\s*[:=])\s*[^\s,;]+/giu, '$1[REDACTED]')
     .replace(/([?&](?:access[_-]?token|refresh[_-]?token|api[_-]?key|secret|signature)=)[^&#\s]+/giu, '$1[REDACTED]');
 }
 
 export function safeErrorMessage(error: unknown, maxLength = 10_000): string {
-  const message = error instanceof Error ? error.message : String(error);
+  const message = error instanceof Error ? error.message : safeString(error);
   const sanitized = Array.from(message, character => {
     const code = character.charCodeAt(0);
     return code < 32 || code === 127 ? ' ' : character;
@@ -49,20 +60,33 @@ function boundedValue(value: unknown, depth: number, seen = new WeakSet<object>(
     if (seen.has(value)) return '[CIRCULAR]';
     seen.add(value);
   }
-  if (Array.isArray(value)) return value.slice(0, MAX_ARRAY_ITEMS).map(item => boundedValue(item, depth + 1, seen));
-  if (typeof value === 'object') {
-    const result: Record<string, unknown> = {};
-    for (const [key, nested] of Object.entries(value).slice(0, MAX_KEYS)) {
-      const bounded = SENSITIVE_KEY.test(key) ? '[REDACTED]' : boundedValue(nested, depth + 1, seen);
-      if (bounded !== undefined) result[key] = bounded;
+  if (Array.isArray(value)) {
+    try {
+      return value.slice(0, MAX_ARRAY_ITEMS).map(item => boundedValue(item, depth + 1, seen));
+    } catch {
+      return '[UNSERIALIZABLE]';
     }
-    return result;
   }
-  return String(value).slice(0, MAX_STRING_LENGTH);
+  if (typeof value === 'object') {
+    try {
+      const result: Record<string, unknown> = {};
+      for (const [key, nested] of Object.entries(value).slice(0, MAX_KEYS)) {
+        const bounded = SENSITIVE_KEY.test(key) ? '[REDACTED]' : boundedValue(nested, depth + 1, seen);
+        if (bounded !== undefined) result[key] = bounded;
+      }
+      return result;
+    } catch {
+      return '[UNSERIALIZABLE]';
+    }
+  }
+  return safeString(value).slice(0, MAX_STRING_LENGTH);
 }
 
 export function writeStructuredLog(level: StructuredLogLevel, record: StructuredLogRecord): void {
-  const safeRecord = boundedValue(record, 0) as Record<string, unknown>;
+  const boundedRecord = boundedValue(record, 0);
+  const safeRecord = boundedRecord && typeof boundedRecord === 'object' && !Array.isArray(boundedRecord)
+    ? boundedRecord as Record<string, unknown>
+    : { event: 'invalid.event' };
   if (typeof safeRecord.event !== 'string' || !SAFE_EVENT_VALUE.test(safeRecord.event)) safeRecord.event = 'invalid.event';
   for (const key of TRACE_KEYS) {
     const value = safeRecord[key];
@@ -74,7 +98,7 @@ export function writeStructuredLog(level: StructuredLogLevel, record: Structured
     if (value === undefined) continue;
     if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) delete safeRecord[key];
   }
-  const serialized = JSON.stringify({ timestamp: new Date().toISOString(), ...safeRecord });
+  const serialized = JSON.stringify({ ...safeRecord, timestamp: new Date().toISOString(), level });
   if (level === 'error') console.error(serialized);
   else if (level === 'warn') console.warn(serialized);
   else console.log(serialized);

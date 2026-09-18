@@ -104,10 +104,10 @@ router.post('/logout', authenticate, validateBody({ refreshToken: { type: 'strin
 
 router.get('/me', authenticate, async (req: AuthenticatedRequest, res: Response) => {
   try {
-    const user = await prisma.user.findFirst({
+    const user = await withTenant(req.user!.userId, tx => tx.user.findFirst({
       where: { id: req.user!.userId, isActive: true },
       select: { id: true, email: true, name: true, createdAt: true },
-    });
+    }));
     if (!user) return res.status(401).json({ success: false, error: 'Invalid user' });
     return res.json({ success: true, data: user });
   } catch (error) {

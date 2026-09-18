@@ -11,7 +11,7 @@ import {
   type PublicApiAdapter,
 } from '@jobagent/job-engine';
 import { executeIdempotentCommand } from './idempotency';
-import { cancelAutomationJob } from './automation-jobs';
+import { cancelAutomationJob, createAutomationJobInTransaction } from './automation-jobs';
 import { safeErrorMessage } from '../observability/structured-log';
 
 export type DiscoverySourceName = 'GREENHOUSE' | 'LEVER' | 'ASHBY';
@@ -431,6 +431,7 @@ async function persistDiscoveryItemAtomic(
     if (!isUniqueConflict(error)) throw error;
     return withTenant(userId, async tx => {
       await assertExecutionAuthority(tx, userId, run.id, authority);
+      const canonicalSource = job.source.trim().toUpperCase();
       const existingItem = await tx.jobDiscoveryItem.findUnique({
         where: { runId_sourceIdentity: { runId: run.id, sourceIdentity: job.sourceJobId } },
       });
@@ -438,14 +439,14 @@ async function persistDiscoveryItemAtomic(
       const identityJob = await tx.job.findUnique({
         where: {
           source_sourceJobId: {
-            source: job.source,
+            source: canonicalSource,
             sourceJobId: accountQualifiedSourceJobId(run.sourceAccount, job.sourceJobId),
           },
         },
         select: { id: true },
       });
       const fingerprintJob = await tx.job.findUnique({
-        where: { fingerprint: accountQualifiedFingerprint(job.source, run.sourceAccount, job.fingerprint) },
+        where: { fingerprint: accountQualifiedFingerprint(canonicalSource, run.sourceAccount, job.fingerprint) },
         select: { id: true },
       });
       const duplicateJob = identityJob ?? fingerprintJob;
@@ -468,10 +469,11 @@ async function persistDiscoveryItem(
   pageNumber: number,
   position: number,
 ): Promise<'created' | 'updated' | 'duplicate'> {
+  const canonicalSource = job.source.trim().toUpperCase();
   const qualifiedSourceJobId = accountQualifiedSourceJobId(run.sourceAccount, job.sourceJobId);
-  const qualifiedFingerprint = accountQualifiedFingerprint(job.source, run.sourceAccount, job.fingerprint);
+  const qualifiedFingerprint = accountQualifiedFingerprint(canonicalSource, run.sourceAccount, job.fingerprint);
   const existingJob = await tx.job.findUnique({
-    where: { source_sourceJobId: { source: job.source, sourceJobId: qualifiedSourceJobId } },
+    where: { source_sourceJobId: { source: canonicalSource, sourceJobId: qualifiedSourceJobId } },
     select: { id: true },
   });
   const fingerprintJob = await tx.job.findUnique({
@@ -485,8 +487,22 @@ async function persistDiscoveryItem(
     return 'duplicate';
   }
   const persisted = await tx.job.upsert({
-    where: { source_sourceJobId: { source: job.source, sourceJobId: qualifiedSourceJobId } },
+    where: { source_sourceJobId: { source: canonicalSource, sourceJobId: qualifiedSourceJobId } },
     create: toJobData(job, run.sourceAccount), update: toJobData(job, run.sourceAccount), select: { id: true },
+  });
+  // Discovery is the first durable stage of the pipeline. Queue analysis in
+  // the same tenant transaction as the Job/DiscoveryItem so a worker cannot
+  // observe a command for a row that was only partially persisted. The raw
+  // content hash makes a changed posting a new idempotent analysis input while
+  // replaying the same discovery item remains a no-op above.
+  await createAutomationJobInTransaction(tx, {
+    userId,
+    type: 'ANALYZE_JOB',
+    payload: { jobId: persisted.id },
+    payloadVersion: 1,
+    correlationId: `analysis:${persisted.id}:${hash}`,
+    idempotencyKey: `analyze-job:${persisted.id}:${hash}`,
+    maxAttempts: 3,
   });
   await createDiscoveryItem(tx, userId, run, job, rawPayload, hash, pageNumber, position, {
     status: 'UPSERTED', jobId: persisted.id,
@@ -633,8 +649,9 @@ function accountQualifiedFingerprint(source: string, sourceAccount: string, fing
 }
 
 function toJobData(job: NormalizedDiscoveryJob, sourceAccount: string) {
+  const source = job.source.trim().toUpperCase();
   return {
-    source: job.source,
+    source,
     sourceJobId: accountQualifiedSourceJobId(sourceAccount, job.sourceJobId),
     company: job.company,
     title: job.title,
@@ -645,7 +662,7 @@ function toJobData(job: NormalizedDiscoveryJob, sourceAccount: string) {
     postedAt: parseDate(job.postedAt),
     applicationUrl: job.applicationUrl,
     sourceUrl: job.sourceUrl,
-    fingerprint: accountQualifiedFingerprint(job.source, sourceAccount, job.fingerprint),
+    fingerprint: accountQualifiedFingerprint(source, sourceAccount, job.fingerprint),
     isActive: true,
   };
 }

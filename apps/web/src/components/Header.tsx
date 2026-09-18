@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { Search, Bell, Sparkles, Command, ShieldCheck, CheckCircle2, User, LogOut } from 'lucide-react';
 import { AuthUser } from '../types';
-import { fetchNotifications, markAllNotificationsRead, markNotificationRead, UINotification } from '../services/api';
+import { fetchNotificationPage, markAllNotificationsRead, markNotificationRead, UINotification } from '../services/api';
 
 interface HeaderProps {
   user: AuthUser;
@@ -16,20 +16,27 @@ export const Header: React.FC<HeaderProps> = ({ user, onSignOut, onOpenCmdK, onO
   const [notifications, setNotifications] = useState<UINotification[]>([]);
   const [notificationsLoading, setNotificationsLoading] = useState(false);
   const [notificationError, setNotificationError] = useState('');
+  const [notificationCursor, setNotificationCursor] = useState<string | null>(null);
+  const [loadingOlderNotifications, setLoadingOlderNotifications] = useState(false);
+
+  const loadNotificationPage = async (before?: string) => {
+    const page = await fetchNotificationPage(before);
+    setNotifications((current) => before ? [...current, ...page.notifications] : page.notifications);
+    setNotificationCursor(page.nextCursor);
+  };
 
   useEffect(() => {
     if (!showNotifications) return;
     setNotificationsLoading(true);
     setNotificationError('');
-    void fetchNotifications()
-      .then(setNotifications)
+    void loadNotificationPage()
       .catch((error) => setNotificationError(error instanceof Error ? error.message : 'Could not load notifications.'))
       .finally(() => setNotificationsLoading(false));
   }, [showNotifications]);
 
   useEffect(() => {
     const refresh = () => {
-      void fetchNotifications().then(setNotifications).catch((error) => setNotificationError(error instanceof Error ? error.message : 'Could not refresh notifications.'));
+      void loadNotificationPage().catch((error) => setNotificationError(error instanceof Error ? error.message : 'Could not refresh notifications.'));
     };
     refresh();
     const timer = window.setInterval(refresh, 30_000);
@@ -44,6 +51,15 @@ export const Header: React.FC<HeaderProps> = ({ user, onSignOut, onOpenCmdK, onO
     } catch (error) {
       setNotificationError(error instanceof Error ? error.message : 'Could not mark notifications as read.');
     }
+  };
+
+  const loadOlderNotifications = async () => {
+    if (!notificationCursor || loadingOlderNotifications) return;
+    setLoadingOlderNotifications(true);
+    setNotificationError('');
+    try { await loadNotificationPage(notificationCursor); }
+    catch (error) { setNotificationError(error instanceof Error ? error.message : 'Could not load older notifications.'); }
+    finally { setLoadingOlderNotifications(false); }
   };
 
   const unreadCount = notifications.filter((notification) => !notification.read).length;
@@ -151,6 +167,11 @@ export const Header: React.FC<HeaderProps> = ({ user, onSignOut, onOpenCmdK, onO
                     </div>
                   </button>
                 ))}
+                {notificationCursor && !notificationsLoading && !notificationError && (
+                  <button type="button" onClick={() => void loadOlderNotifications()} disabled={loadingOlderNotifications} className="w-full rounded-lg border border-slate-800 px-2 py-2 text-[10px] text-indigo-300 disabled:opacity-50">
+                    {loadingOlderNotifications ? 'Loading older notifications…' : 'Load older notifications'}
+                  </button>
+                )}
               </div>
             </div>
           )}

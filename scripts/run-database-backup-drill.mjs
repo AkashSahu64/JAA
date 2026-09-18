@@ -7,6 +7,7 @@ import { verifyBackupManifest, writeBackupManifest } from './database-integrity.
 
 const docker = process.env.DOCKER_BIN ?? (process.platform === 'win32' ? 'C:\\Program Files\\Docker\\Docker\\resources\\bin\\docker.exe' : 'docker');
 const container = process.env.POSTGRES_CONTAINER ?? 'job-application-agent-postgres-1';
+const postgresPassword = process.env.POSTGRES_PASSWORD ?? 'jobagent-local';
 const outputDir = process.env.BACKUP_DRILL_OUTPUT_DIR ?? join(process.env.TEMP ?? '.', 'jobagent-backup-drill');
 const key = process.env.BACKUP_ENCRYPTION_KEY;
 validateBackupEncryptionKey(key);
@@ -21,7 +22,7 @@ function runDocker(args, input) {
 }
 
 try {
-  const dump = runDocker(['exec', '-e', 'PGPASSWORD=jobagent-local', container, 'pg_dump', '--format=custom', '--no-owner', '--username', 'jobagent', '--dbname', 'jobagent']);
+  const dump = runDocker(['exec', '-e', `PGPASSWORD=${postgresPassword}`, container, 'pg_dump', '--format=custom', '--no-owner', '--username', 'jobagent', '--dbname', 'jobagent']);
   if (dump.length === 0) throw new Error('PostgreSQL dump is empty');
   writeFileSync(plainPath, dump, { mode: 0o600 });
   const encrypted = encryptBackupBytes(dump, key);

@@ -22,8 +22,11 @@ describeDatabase.sequential('live HTTP readiness', () => {
   });
 
   it('separates liveness from authoritative database readiness', async () => {
-    const health = await fetch(`${baseUrl}/api/health`);
+    const traceparent = '00-abcdef0123456789abcdef0123456789-abcdef0123456789-01';
+    const health = await fetch(`${baseUrl}/api/health`, { headers: { traceparent } });
     expect(health.status).toBe(200);
+    expect(health.headers.get('traceparent')).toBe(traceparent);
+    expect(health.headers.get('x-correlation-id')).toMatch(/^[0-9a-f-]{36}$/);
     expect(await health.json()).toMatchObject({ status: 'ok' });
     const ready = await fetch(`${baseUrl}/api/ready`);
     expect(ready.status).toBe(200);

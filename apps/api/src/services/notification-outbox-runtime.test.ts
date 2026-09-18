@@ -11,7 +11,12 @@ vi.mock('../routes/sse', () => ({ broadcastToUser: mocks.broadcast }));
 import { startNotificationOutboxRuntime } from './notification-outbox-runtime';
 
 describe('notification outbox runtime', () => {
-  beforeEach(() => { vi.useFakeTimers(); mocks.publish.mockReset().mockResolvedValue({ claimed: 0, published: 0, retried: 0, failed: 0 }); });
+  beforeEach(() => {
+    vi.useFakeTimers();
+    mocks.publish.mockReset().mockResolvedValue({ claimed: 0, published: 0, retried: 0, failed: 0 });
+    mocks.consume.mockReset();
+    mocks.broadcast.mockReset();
+  });
   afterEach(() => { vi.useRealTimers(); });
 
   it('delivers on startup, suppresses overlapping ticks, and closes cleanly', async () => {
@@ -33,6 +38,7 @@ describe('notification outbox runtime', () => {
     expect(() => startNotificationOutboxRuntime({ intervalMs: 249 })).toThrow('at least 250ms');
     expect(() => startNotificationOutboxRuntime({ batchSize: 501 })).toThrow('between 1 and 500');
     expect(() => startNotificationOutboxRuntime({ shutdownTimeoutMs: 999 })).toThrow('shutdown timeout');
+    expect(() => startNotificationOutboxRuntime({ shutdownTimeoutMs: 120_001 })).toThrow('between one second and two minutes');
     const error = new Error('database unavailable');
     mocks.publish.mockRejectedValueOnce(error);
     const onError = vi.fn();
@@ -55,6 +61,28 @@ describe('notification outbox runtime', () => {
     const runtime = startNotificationOutboxRuntime({ intervalMs: 250 });
     await new Promise(resolve => setTimeout(resolve, 0));
     expect(mocks.broadcast).toHaveBeenCalledWith('user-1', expect.objectContaining({ id: expect.any(String), type: 'notification' }));
+    await runtime.close();
+  });
+
+  it('does not rebroadcast an idempotent outbox replay', async () => {
+    vi.useRealTimers();
+    const event = {
+      id: 'outbox-replay', userId: 'user-1', aggregateType: 'HumanVerification', aggregateId: 'verification-1',
+      eventType: 'human-verification.requested', payload: { applicationId: 'application-1', verificationId: 'verification-1', type: 'CAPTCHA' },
+      schemaVersion: 1, correlationId: 'correlation-1', idempotencyKey: 'human-verification-requested:verification-1',
+      occurredAt: new Date(), publishAttempts: 1,
+    };
+    mocks.consume
+      .mockResolvedValueOnce({ responseCode: 201, responseBody: { consumed: true }, replayed: false })
+      .mockResolvedValueOnce({ responseCode: 201, responseBody: { consumed: true }, replayed: true });
+    mocks.publish.mockImplementationOnce(async (transport: (value: typeof event) => Promise<void>) => {
+      await transport(event);
+      await transport(event);
+      return { claimed: 2, published: 2, retried: 0, failed: 0 };
+    });
+    const runtime = startNotificationOutboxRuntime({ intervalMs: 250 });
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(mocks.broadcast).toHaveBeenCalledOnce();
     await runtime.close();
   });
 });

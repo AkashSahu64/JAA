@@ -58,6 +58,16 @@ const transitionNotifications: Readonly<Record<string, NotificationCopy>> = {
     title: 'Application needs attention',
     message: 'Application processing failed. Review the application for details and next steps.',
   },
+  REJECTED: {
+    type: NotificationType.APPLICATION_REJECTED,
+    title: 'Application update',
+    message: 'This application was marked as rejected. Review the application for details.',
+  },
+  WITHDRAWN: {
+    type: NotificationType.APPLICATION_WITHDRAWN,
+    title: 'Application withdrawn',
+    message: 'This application was withdrawn and will not continue through the application workflow.',
+  },
   INTERVIEW: {
     type: NotificationType.INTERVIEW_DETECTED,
     title: 'Interview detected',
@@ -69,6 +79,10 @@ const transitionNotifications: Readonly<Record<string, NotificationCopy>> = {
     message: 'An offer was recorded for this application.',
   },
 };
+
+function hasControlCharacters(value: string): boolean {
+  return Array.from(value).some(character => character.charCodeAt(0) < 32 || character.charCodeAt(0) === 127);
+}
 
 function isObject(value: Prisma.JsonValue): value is Prisma.JsonObject {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -91,20 +105,28 @@ function deterministicNotificationId(event: OutboxEnvelope, type: NotificationTy
 
 function validEnvelopeBoundary(event: OutboxEnvelope): boolean {
   const boundedText = (value: unknown, max: number) => typeof value === 'string' && Boolean(value.trim()) && value.length <= max;
-  return boundedText(event.id, 200)
+  return boundedText(event.id, 200) && !hasControlCharacters(event.id)
     && (event.userId === null || boundedText(event.userId, 200))
-    && boundedText(event.aggregateType, 100)
-    && boundedText(event.aggregateId, 200)
-    && boundedText(event.eventType, 200)
-    && boundedText(event.correlationId, 200)
-    && boundedText(event.idempotencyKey, 300)
+    && (event.userId === null || !hasControlCharacters(event.userId))
+    && boundedText(event.aggregateType, 100) && !hasControlCharacters(event.aggregateType)
+    && boundedText(event.aggregateId, 200) && !hasControlCharacters(event.aggregateId)
+    && boundedText(event.eventType, 200) && !hasControlCharacters(event.eventType)
+    && boundedText(event.correlationId, 200) && !hasControlCharacters(event.correlationId)
+    && boundedText(event.idempotencyKey, 300) && !hasControlCharacters(event.idempotencyKey)
     && event.schemaVersion === 1
     && event.occurredAt instanceof Date
     && Number.isFinite(event.occurredAt.getTime());
 }
 
 function boundedPayloadText(value: unknown, max = 200): value is string {
-  return typeof value === 'string' && Boolean(value.trim()) && value.length <= max;
+  return typeof value === 'string' && Boolean(value.trim()) && value.length <= max && !hasControlCharacters(value);
+}
+
+function operationalAlertPayload(value: Prisma.JsonValue): { code: string; severity: string; message: string; value: number; threshold: number } | null {
+  if (!isObject(value) || !boundedPayloadText(value.code, 80) || !boundedPayloadText(value.severity, 20)
+    || !boundedPayloadText(value.message, 500) || typeof value.value !== 'number' || !Number.isFinite(value.value)
+    || typeof value.threshold !== 'number' || !Number.isFinite(value.threshold)) return null;
+  return { code: value.code, severity: value.severity, message: value.message, value: value.value, threshold: value.threshold };
 }
 
 export function mapOutboxEventToNotification(event: OutboxEnvelope): NotificationMapping | null {
@@ -162,6 +184,16 @@ export function mapOutboxEventToNotification(event: OutboxEnvelope): Notificatio
       title: 'Submission needs verification',
       message: 'Submission outcome is unknown; independent confirmation is still required and automatic retry is blocked.',
       data: { outboxEventId: event.id, correlationId: event.correlationId, applicationId: event.payload.applicationId, authorizationId: event.aggregateId, eventType: event.eventType },
+    };
+  }
+  if (event.aggregateType === 'AutomationOperations' && event.eventType === 'automation.alert') {
+    const payload = operationalAlertPayload(event.payload);
+    if (!payload) return null;
+    return {
+      id: deterministicNotificationId(event, NotificationType.OPERATIONAL_ALERT), userId: event.userId,
+      type: NotificationType.OPERATIONAL_ALERT, title: `Automation alert: ${payload.code}`,
+      message: payload.message,
+      data: { outboxEventId: event.id, correlationId: event.correlationId, code: payload.code, severity: payload.severity, value: payload.value, threshold: payload.threshold },
     };
   }
   if (event.aggregateType === 'Application' && event.eventType === 'application.review-required') {

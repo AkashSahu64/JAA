@@ -2,12 +2,33 @@ import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { describe, expect, it } from 'vitest';
+import { afterAll, describe, expect, it } from 'vitest';
 
 const databaseUrl = process.env.DATABASE_URL;
 const integrationEnabled = process.env.DATABASE_INTEGRATION === '1' && Boolean(databaseUrl);
 const describeDatabase = integrationEnabled ? describe : describe.skip;
 const postgresContainer = process.env.POSTGRES_CONTAINER ?? 'job-application-agent-postgres-1';
+
+/**
+ * Fixture rows this file inserts directly, in insertion order. Several checks here
+ * exist precisely to prove the database rejects a cross-tenant write, so the
+ * successful inserts they depend on must be removed afterwards: without this the
+ * suite grows the shared database on every run and stops being reproducible.
+ */
+const insertedFixtures: Array<{ table: string; id: string }> = [];
+
+function track<T extends string>(table: string, id: T): T {
+  insertedFixtures.push({ table, id });
+  return id;
+}
+
+afterAll(() => {
+  if (!integrationEnabled) return;
+  // Reverse insertion order so rows are removed before the rows they reference.
+  for (const { table, id } of insertedFixtures.reverse()) {
+    sql(`DELETE FROM ${table} WHERE id = '${id}'`);
+  }
+});
 
 function sql(statement: string, user = 'jobagent'): string {
   if (!databaseUrl) throw new Error('DATABASE_URL is required');
@@ -51,7 +72,7 @@ describeDatabase('PostgreSQL foundation', () => {
 
   it('denies cross-tenant reads and writes for the restricted role', () => {
     const tenantA = '00000000-0000-4000-8000-000000000001';
-    const tenantB = randomUUID();
+    const tenantB = track('users', randomUUID());
     sql(`INSERT INTO users (id, email, "passwordHash", name, "createdAt", "updatedAt") VALUES ('${tenantB}', '${tenantB}@example.invalid', 'fixture', 'Tenant B', now(), now())`);
     expect(asApp(`SELECT set_config('app.current_user_id', '${tenantA}', true); SELECT COUNT(*) FROM users`).split('\n').at(-1)).toBe('1');
     expect(() => asApp(`SELECT set_config('app.current_user_id', '${tenantA}', true); INSERT INTO notifications (id, "userId", type, title, message, read, "createdAt") VALUES ('${randomUUID()}', '${tenantB}', 'TEST', 'x', 'x', false, now())`)).toThrow();
@@ -59,7 +80,7 @@ describeDatabase('PostgreSQL foundation', () => {
 
   it('allows only the service role to publish tenant outbox rows globally', () => {
     const tenant = '00000000-0000-4000-8000-000000000001';
-    const eventId = randomUUID();
+    const eventId = track('outbox_events', randomUUID());
     sql(`INSERT INTO outbox_events (id, "userId", "aggregateType", "aggregateId", "eventType", payload, "schemaVersion", "correlationId", "idempotencyKey", "occurredAt", "availableAt", "publishAttempts") VALUES ('${eventId}', '${tenant}', 'RLSFixture', '${eventId}', 'fixture.created', '{}', 1, '${randomUUID()}', '${randomUUID()}', now(), now(), 0)`);
     expect(asApp(`SELECT set_config('app.current_user_id', '${randomUUID()}', true); SELECT COUNT(*) FROM outbox_events WHERE id = '${eventId}'`).split('\n').at(-1)).toBe('0');
     expect(sql(`SET ROLE jobagent_service; SELECT COUNT(*) FROM outbox_events WHERE id = '${eventId}'`).split('\n').at(-1)).toBe('1');
@@ -67,10 +88,10 @@ describeDatabase('PostgreSQL foundation', () => {
 
   it('rejects ownership mismatches between applications and child records', () => {
     const owner = '00000000-0000-4000-8000-000000000001';
-    const other = randomUUID();
-    const jobId = randomUUID();
-    const versionId = randomUUID();
-    const applicationId = randomUUID();
+    const other = track('users', randomUUID());
+    const jobId = track('jobs', randomUUID());
+    const versionId = track('resume_versions', randomUUID());
+    const applicationId = track('applications', randomUUID());
     sql(`
       INSERT INTO users (id, email, "passwordHash", name, "createdAt", "updatedAt") VALUES ('${other}', '${other}@example.invalid', 'fixture', 'Other', now(), now()) ON CONFLICT DO NOTHING;
       INSERT INTO jobs (id, source, company, title, description, "applicationUrl", "sourceUrl", "discoveredAt", "updatedAt") VALUES ('${jobId}', 'fixture', 'Example', 'Engineer', 'fixture', 'https://example.invalid/apply', 'https://example.invalid/job', now(), now());

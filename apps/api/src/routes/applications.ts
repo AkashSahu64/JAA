@@ -10,6 +10,7 @@ import { authorizeSubmission, SubmissionEngineError } from '../services/submissi
 import { decideOffer, recordInterview, recordOffer, type OfferDecision } from '../services/application-lifecycle';
 import { ApplicationAnswerError, decideApplicationAnswer, saveApplicationAnswerDraft, type ApplicationAnswerDecision, type ApplicationAnswerSource } from '../services/application-answers';
 import { scheduleApplicationRun, SchedulerError } from '../services/durable-scheduler';
+import { ApplicationFormPreparationError, prepareApplicationForForm } from '../services/application-form-preparation';
 import { logRouteError } from '../observability/structured-log';
 
 const router = Router();
@@ -18,8 +19,15 @@ router.use(authenticate);
 const APPLICATION_STATUSES = new Set(Object.values(ApplicationStatus));
 
 const APPLICATION_ANSWER_SOURCES = new Set<ApplicationAnswerSource>(['USER_PROFILE', 'USER_INPUT', 'COVER_LETTER', 'AI_SUGGESTION']);
-const isAnswerValue = (value: unknown): value is string | boolean | readonly string[] => typeof value === 'string' || typeof value === 'boolean'
-  || (Array.isArray(value) && value.every(item => typeof item === 'string'));
+const APPLICATION_PROFILE_KEYS = new Set(['firstName', 'lastName', 'email', 'phone', 'location', 'linkedinUrl', 'websiteUrl']);
+const isAnswerValue = (value: unknown, source: ApplicationAnswerSource): boolean => {
+  if (source === 'USER_PROFILE') return Boolean(value && typeof value === 'object' && !Array.isArray(value)
+    && Object.keys(value).length === 1 && typeof (value as { profileKey?: unknown }).profileKey === 'string'
+    && APPLICATION_PROFILE_KEYS.has((value as { profileKey: string }).profileKey));
+  if (source === 'COVER_LETTER') return Boolean(value && typeof value === 'object' && !Array.isArray(value)
+    && Object.keys(value).length === 1 && (value as { source?: unknown }).source === 'coverLetter');
+  return typeof value === 'string' || typeof value === 'boolean' || (Array.isArray(value) && value.every(item => typeof item === 'string'));
+};
 
 // GET /api/applications/:id/answers - Read tenant-owned questions and answer review state.
 router.get('/:id/answers', async (req: AuthenticatedRequest, res: Response) => {
@@ -42,7 +50,7 @@ router.post('/:id/answers', async (req: AuthenticatedRequest, res: Response) => 
   const source = req.body?.source;
   const expectedVersion = req.body?.expectedVersion;
   const provenance = req.body?.provenance;
-  if (!questionId || !isAnswerValue(req.body?.value) || !APPLICATION_ANSWER_SOURCES.has(source)
+  if (!questionId || !APPLICATION_ANSWER_SOURCES.has(source) || !isAnswerValue(req.body?.value, source as ApplicationAnswerSource)
     || (expectedVersion !== undefined && (!Number.isSafeInteger(expectedVersion) || expectedVersion < 1))
     || (provenance !== undefined && (typeof provenance !== 'object' || provenance === null || Array.isArray(provenance)))) {
     return res.status(400).json({ success: false, error: 'questionId, supported value, source, and valid provenance are required' });
@@ -352,16 +360,35 @@ router.post('/:id/evaluate-quality', async (req: AuthenticatedRequest, res: Resp
   }
 });
 
+// POST /api/applications/:id/prepare-form - Explicitly advance a qualified application to provider form preparation.
+router.post('/:id/prepare-form', validateBody({
+  correlationId: { type: 'string', required: true, minLength: 1, maxLength: 200 },
+}), async (req: AuthenticatedRequest, res: Response) => {
+  const idempotencyKey = req.get('Idempotency-Key')?.trim();
+  if (!idempotencyKey || idempotencyKey.length > 200) return res.status(400).json({ success: false, error: 'Idempotency-Key is required and must be at most 200 characters' });
+  try {
+    const result = await prepareApplicationForForm({ userId: req.user!.userId, applicationId: req.params.id.trim(), idempotencyKey, correlationId: req.body.correlationId.trim() });
+    return res.status(result.automationJob.replayed ? 200 : 202).json({ success: true, data: result, replayed: result.automationJob.replayed });
+  } catch (error) {
+    if (error instanceof ApplicationFormPreparationError) {
+      const status = error.code === 'INVALID' ? 400 : error.code === 'NOT_FOUND' ? 404 : error.code === 'CONFLICT' ? 409 : 422;
+      return res.status(status).json({ success: false, error: error.message, code: error.code });
+    }
+    logRouteError('applications.prepare_form_failure', error, { correlationId: req.get('x-correlation-id'), userId: req.user?.userId, applicationId: req.params.id });
+    return res.status(500).json({ success: false, error: 'Failed to prepare application form' });
+  }
+});
+
 // POST /api/applications/:id/complete-greenhouse - Queue fail-closed Greenhouse form completion.
 router.post('/:id/complete-greenhouse', async (req: AuthenticatedRequest, res: Response) => {
   try {
     const applicationId = req.params.id.trim();
     if (!applicationId) return res.status(400).json({ success: false, error: 'application identifier is required' });
     const application = await withTenant(req.user!.userId, tx => tx.application.findFirst({
-      where: { id: applicationId, userId: req.user!.userId, status: 'APPLICATION_STARTED', job: { source: 'GREENHOUSE' } },
-      select: { id: true },
+      where: { id: applicationId, userId: req.user!.userId, status: 'APPLICATION_STARTED' },
+      select: { id: true, job: { select: { source: true } } },
     }));
-    if (!application) return res.status(404).json({ success: false, error: 'Application ready for Greenhouse completion not found' });
+    if (!application || application.job.source.trim().toUpperCase() !== 'GREENHOUSE') return res.status(404).json({ success: false, error: 'Application ready for Greenhouse completion not found' });
     const queued = await createAutomationJob({
       userId: req.user!.userId,
       applicationId,
@@ -385,10 +412,10 @@ router.post('/:id/complete-lever', async (req: AuthenticatedRequest, res: Respon
     const applicationId = req.params.id.trim();
     if (!applicationId) return res.status(400).json({ success: false, error: 'application identifier is required' });
     const application = await withTenant(req.user!.userId, tx => tx.application.findFirst({
-      where: { id: applicationId, userId: req.user!.userId, status: 'APPLICATION_STARTED', job: { source: 'LEVER' } },
-      select: { id: true },
+      where: { id: applicationId, userId: req.user!.userId, status: 'APPLICATION_STARTED' },
+      select: { id: true, job: { select: { source: true } } },
     }));
-    if (!application) return res.status(404).json({ success: false, error: 'Application ready for Lever completion not found' });
+    if (!application || application.job.source.trim().toUpperCase() !== 'LEVER') return res.status(404).json({ success: false, error: 'Application ready for Lever completion not found' });
     const queued = await createAutomationJob({
       userId: req.user!.userId,
       applicationId,

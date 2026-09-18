@@ -90,7 +90,7 @@ export async function syncEmailConnection(input: { userId: string; connectionId:
       // Optimistic ownership: a concurrent sync that already advanced the
       // cursor must not be overwritten by this slower page.
       where: { id: connection.id, userId: input.userId, status: 'ACTIVE', syncCursor: connection.syncCursor },
-      data: { syncCursor: nextCursor, lastSyncAt: syncAt },
+      data: { syncCursor: nextCursor, lastSyncAt: syncAt, syncClaimedAt: null },
     });
     if (advanced.count !== 1) throw new Error('Mailbox sync cursor changed; retry from the current durable cursor');
     await db.auditLog.create({ data: { userId: input.userId, action: 'EMAIL_SYNC_COMPLETED', resource: 'EmailConnection', resourceId: connection.id, details: { provider: connection.provider, ingested, nextCursorPresent: nextCursor !== null, correlationId: input.correlationId?.trim() ?? null } } });

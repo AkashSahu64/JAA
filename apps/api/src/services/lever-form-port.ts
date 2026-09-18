@@ -1,7 +1,7 @@
 import type { Locator, Page } from 'playwright';
 import type { LeverFormPort, LeverFormSnapshot } from '@jobagent/job-engine';
 
-const leverFieldSelector = 'input[name], input[id], textarea[name], textarea[id], select[name], select[id], [role="combobox"][name], [role="combobox"][id], [role="combobox"][data-field]';
+const leverFieldSelector = 'input[name], input[id], textarea[name], textarea[id], select[name], select[id], [role="combobox"][name], [role="combobox"][id], [role="combobox"][data-field], [role="combobox"][aria-label], [role="combobox"][aria-labelledby]';
 
 type FieldKind = 'TEXT' | 'TEXTAREA' | 'SELECT' | 'RADIO' | 'CHECKBOX' | 'FILE' | 'COMBOBOX' | 'MULTISELECT' | 'HIDDEN';
 
@@ -34,16 +34,24 @@ export class LeverPlaywrightFormPort implements LeverFormPort {
       const tagName = control.tagName;
       const type = tagName === 'INPUT' ? (control as HTMLInputElement).type.toLowerCase() : '';
       const declaredName = control.getAttribute('name')?.trim() || '';
-      const id = control.name || declaredName || control.id || control.getAttribute('data-field') || '';
-      const name = control.name || declaredName || control.id || control.getAttribute('data-field') || '';
+      const ariaLabel = control.getAttribute('aria-label')?.trim() || '';
+      const labelledBy = control.getAttribute('aria-labelledby');
+      const ariaLabelledByText = labelledBy
+        ? labelledBy.split(/\s+/).map(reference => document.getElementById(reference)?.textContent ?? '').join(' ').trim()
+        : '';
+      // Some Lever custom controls intentionally expose no name/id. Use their
+      // accessible name as a semantic fallback; generic intelligence assigns
+      // occurrence identity for duplicates, so this never depends on ordering.
+      const semanticFallback = ariaLabel || ariaLabelledByText;
+      const id = control.name || declaredName || control.id || control.getAttribute('data-field') || semanticFallback;
+      const name = control.name || declaredName || control.id || control.getAttribute('data-field') || semanticFallback;
       const label = control.id
         ? document.querySelector(`label[for=${JSON.stringify(control.id)}]`)?.textContent
         : control.closest('label')?.textContent;
-      const labelledBy = control.getAttribute('aria-labelledby');
       const accessibleLabel = labelledBy
-        ? labelledBy.split(/\s+/).map(reference => document.getElementById(reference)?.textContent ?? '').join(' ')
+        ? ariaLabelledByText
         : undefined;
-      const accessibleName = accessibleLabel?.trim() || control.getAttribute('aria-label')?.trim() || undefined;
+      const accessibleName = accessibleLabel?.trim() || ariaLabel || undefined;
       const multiple = tagName === 'SELECT' && (control as HTMLSelectElement).multiple;
       const radioGroup = type === 'radio'
         ? [...document.querySelectorAll('input[type="radio"]')].filter(candidate => (candidate as HTMLInputElement).name === id)
@@ -118,10 +126,17 @@ export class LeverPlaywrightFormPort implements LeverFormPort {
     await this.control(fieldId).setInputFiles({ name: document.fileName, mimeType: document.mimeType, buffer: Buffer.from(document.bytes) });
   }
   async validate(): Promise<readonly { fieldId?: string; message: string }[]> {
-    return this.page.locator('[aria-invalid="true"], .field-error, .error-message').evaluateAll(elements => elements.map(element => ({
-      fieldId: element.getAttribute('data-field') ?? element.closest('[data-field]')?.getAttribute('data-field') ?? undefined,
-      message: element.textContent?.trim() ?? '',
-    })).filter(error => error.message));
+    return this.page.locator('[aria-invalid="true"], .field-error, .error-message').evaluateAll(elements => elements.map(element => {
+      const direct = element.getAttribute('data-field') ?? element.closest('[data-field]')?.getAttribute('data-field');
+      const errorId = element.id;
+      const describedControl = errorId
+        ? [...document.querySelectorAll('[aria-errormessage]')].find(control =>
+          control.getAttribute('aria-errormessage')?.split(/\s+/).includes(errorId))
+        : undefined;
+      const control = describedControl as HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement | undefined;
+      const fieldId = direct ?? control?.name ?? control?.id ?? undefined;
+      return { fieldId, message: element.textContent?.trim() ?? '' };
+    }).filter(error => error.message));
   }
   async advance(): Promise<void> {
     const next = this.nextStepButton();

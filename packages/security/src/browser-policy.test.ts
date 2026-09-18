@@ -4,6 +4,8 @@ import {
   BrowserNavigationPolicyError,
   classifyBlockedIpLiteral,
   classifyHumanVerification,
+  HUMAN_VERIFICATION_KINDS,
+  isHumanVerificationKind,
   normalizeBrowserHostname,
 } from './browser-policy';
 
@@ -157,5 +159,14 @@ describe('human verification classification', () => {
   it('prioritizes CAPTCHA and MFA when several conservative signals occur', () => {
     expect(classifyHumanVerification({ captcha: true, authentication: true })?.kind).toBe('CAPTCHA');
     expect(classifyHumanVerification({ mfa: true, antiBot: true })?.kind).toBe('MFA');
+  });
+
+  it('accepts only the four contracted verification kinds and rejects everything else', () => {
+    expect(HUMAN_VERIFICATION_KINDS).toEqual(['CAPTCHA', 'MFA', 'ANTI_BOT', 'AUTH']);
+    for (const kind of HUMAN_VERIFICATION_KINDS) expect(isHumanVerificationKind(kind)).toBe(true);
+    // Values an untrusted page could supply for an annotated verification control.
+    for (const value of ['BYPASS', 'captcha', 'CAPTCHA ', '', ' CAPTCHA', 'AUTH\n', 0, null, undefined, {}, ['CAPTCHA'], true]) {
+      expect(isHumanVerificationKind(value)).toBe(false);
+    }
   });
 });

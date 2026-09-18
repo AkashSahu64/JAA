@@ -4,6 +4,7 @@ import {
   AutomationJobRetryError,
   effectiveAutomationJobRetryDelayMs,
   validateAutomationJobNow,
+  validateAutomationJobMaxAttempts,
 } from './automation-jobs';
 
 describe('automation job errors', () => {
@@ -36,5 +37,12 @@ describe('automation job errors', () => {
 
   it('rejects invalid recovery timestamps before database work', () => {
     expect(() => validateAutomationJobNow(new Date(Number.NaN))).toThrow('now must be a valid Date');
+  });
+
+  it('bounds durable retry budgets', () => {
+    expect(() => validateAutomationJobMaxAttempts(0)).toThrow('maxAttempts must be a positive integer');
+    expect(() => validateAutomationJobMaxAttempts(101)).toThrow('must not exceed 100');
+    expect(() => validateAutomationJobMaxAttempts(Number.MAX_SAFE_INTEGER)).toThrow('must not exceed 100');
+    expect(() => validateAutomationJobMaxAttempts(100)).not.toThrow();
   });
 });

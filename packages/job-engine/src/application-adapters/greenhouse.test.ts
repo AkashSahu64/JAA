@@ -33,7 +33,7 @@ describe('GreenhouseApplicationAdapter', () => {
     });
     const result = await new GreenhouseApplicationAdapter().fillCurrentStep(form, {
       firstName: 'Ada', lastName: 'Lovelace', email: 'ada@example.invalid',
-    });
+    }, [], 'fixture-owner');
 
     expect(form.fill).toHaveBeenCalledTimes(3);
     expect(result).toMatchObject({ filledFieldIds: ['first', 'last', 'email'], advanced: true });
@@ -113,7 +113,7 @@ describe('GreenhouseApplicationAdapter', () => {
 
     const result = await new GreenhouseApplicationAdapter().fillCurrentStep(form, {
       email: 'ada@example.invalid', location: 'London',
-    });
+    }, [], 'fixture-owner');
 
     expect(form.fill).toHaveBeenCalledWith('opaque_email', 'ada@example.invalid');
     expect(form.select).not.toHaveBeenCalled();

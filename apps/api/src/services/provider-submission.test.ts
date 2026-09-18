@@ -9,16 +9,23 @@ vi.mock('@jobagent/database', () => ({
   withTenant: async (_userId: string, operation: (tx: typeof transaction) => unknown) => operation(transaction),
 }));
 
-vi.mock('@jobagent/job-engine', () => ({
-  greenhouseApplicationHost: (url: string) => ['boards.greenhouse.io', 'job-boards.greenhouse.io'].includes(new URL(url).hostname) ? new URL(url).hostname : null,
-  leverApplicationHost: (url: string) => new URL(url).hostname === 'jobs.lever.co' ? 'jobs.lever.co' : null,
-  GreenhouseApplicationAdapter: class {
-    fillCurrentStep = fillCurrentStep;
-  },
-  LeverApplicationAdapter: class {
-    fillCurrentStep = fillCurrentStep;
-  },
-}));
+vi.mock('@jobagent/job-engine', async importActual => {
+  const actual = await importActual<typeof import('@jobagent/job-engine')>();
+  return {
+    greenhouseApplicationHost: (url: string) => ['boards.greenhouse.io', 'job-boards.greenhouse.io'].includes(new URL(url).hostname) ? new URL(url).hostname : null,
+    leverApplicationHost: (url: string) => new URL(url).hostname === 'jobs.lever.co' ? 'jobs.lever.co' : null,
+    GreenhouseApplicationAdapter: class {
+      fillCurrentStep = fillCurrentStep;
+    },
+    LeverApplicationAdapter: class {
+      fillCurrentStep = fillCurrentStep;
+    },
+    // The real completion rule, not a stand-in: this suite depends on how the submission
+    // loop re-evaluates a step after the authorized documents are attached, and a fake
+    // here would let that ordering drift away from production silently.
+    advanceStepIfComplete: actual.advanceStepIfComplete,
+  };
+});
 
 import { ProviderSubmissionError, ProviderSubmissionService } from './provider-submission';
 
@@ -26,7 +33,7 @@ const authorization = {
   id: 'authorization-1',
   applicationVersion: 2,
   resumeVersionId: 'resume-version-1',
-  preflightEvidence: { resumeVersionId: 'resume-version-1', resumeDocument: { id: 'object-1', kind: 'RESUME_APPROVED', bucket: 'private', objectKey: 'private/resume_approved/user-1/' + 'a'.repeat(64), versionId: null, fileName: 'resume.pdf', mimeType: 'application/pdf', byteSize: '20', checksumSha256: 'a'.repeat(64), encryptionKeyRef: 'S3_MANAGED', scanStatus: 'CLEAN' } },
+  preflightEvidence: { resumeVersionId: 'resume-version-1', resumeDocument: { id: 'object-1', kind: 'RESUME_APPROVED', bucket: 'private', objectKey: 'private/resume_approved/user-1/' + 'a'.repeat(64), versionId: null, fileName: 'resume.pdf', mimeType: 'application/pdf', byteSize: '20', checksumSha256: 'a'.repeat(64), encryptionKeyRef: 'S3_MANAGED', scanStatus: 'CLEAN', approvalStatus: 'APPROVED', approvedAt: '2026-09-14T00:00:00.000Z', approvedBy: 'user-1' } },
   application: {
     id: 'application-1',
     version: 3,
@@ -37,7 +44,7 @@ const authorization = {
       objectMetadata: {
         id: 'object-1', userId: 'user-1', resumeId: 'resume-1', resumeVersionId: 'resume-version-1', kind: 'RESUME_APPROVED', bucket: 'private', objectKey: 'private/resume_approved/user-1/' + 'a'.repeat(64), versionId: null,
         fileName: 'resume.pdf', mimeType: 'application/pdf', encryptionKeyRef: 'S3_MANAGED', checksumSha256: 'a'.repeat(64),
-        byteSize: BigInt(20), scanStatus: 'CLEAN', deletedAt: null, expiresAt: null,
+        byteSize: BigInt(20), scanStatus: 'CLEAN', approvalStatus: 'APPROVED', approvedAt: new Date('2026-09-14T00:00:00.000Z'), approvedBy: 'user-1', deletedAt: null, expiresAt: null,
       },
       resume: {
         objectMetadata: {
@@ -81,8 +88,13 @@ function service(page: ReturnType<typeof pageFixture>['page'], requestVerificati
     const uploadLocator = page.locator('upload') as { setInputFiles: (value: unknown) => Promise<void> };
     await uploadLocator.setInputFiles({ name: document.fileName, mimeType: document.mimeType, buffer: Buffer.from(document.bytes) });
   });
-  const ports = { GREENHOUSE: vi.fn(() => ({ uploadDocument })), LEVER: vi.fn(() => ({ uploadDocument })) };
-  return { service: new ProviderSubmissionService(browserSessions as never, documentStorage, ports as never, requestVerification), browserSessions, documentStorage, ports, requestVerification };
+  const advance = vi.fn(async () => undefined);
+  const fill = vi.fn(async () => undefined);
+  const ports = {
+    GREENHOUSE: vi.fn(() => ({ uploadDocument, advance, fill })),
+    LEVER: vi.fn(() => ({ uploadDocument, advance, fill })),
+  };
+  return { service: new ProviderSubmissionService(browserSessions as never, documentStorage, ports as never, requestVerification), browserSessions, documentStorage, ports, requestVerification, advance, fill };
 }
 
 function input() {
@@ -155,11 +167,33 @@ describe('ProviderSubmissionService', () => {
     expect(fixture.submit.first).toHaveBeenCalledOnce();
   });
 
+  it('canonicalizes lowercase provider sources emitted by discovery adapters', async () => {
+    transaction.submissionAuthorization.findFirst.mockResolvedValue({
+      ...authorization,
+      application: {
+        ...authorization.application,
+        job: { source: 'greenhouse', applicationUrl: 'https://boards.greenhouse.io/example/jobs/1' },
+      },
+    });
+    fillCurrentStep.mockResolvedValue({
+      advanced: false,
+      validationErrors: [],
+      requiredBlockingFieldIds: ['resume'],
+      fields: [{ id: 'resume', kind: 'FILE', name: 'resume', label: 'Resume' }],
+    });
+    const fixture = pageFixture();
+    const subject = service(fixture.page);
+
+    await expect(subject.service.execute(input())).resolves.toMatchObject({ provider: 'GREENHOUSE' });
+    expect(subject.ports.GREENHOUSE).toHaveBeenCalledOnce();
+    expect(subject.ports.LEVER).not.toHaveBeenCalled();
+  });
+
   it('uploads the exact attached cover-letter artifact when the provider requests a file', async () => {
     const coverLetterDocument = {
       id: 'cover-object-1', userId: 'user-1', resumeVersionId: 'resume-version-1', kind: 'COVER_LETTER', bucket: 'private',
       objectKey: 'private/cover_letter/user-1/' + 'c'.repeat(64), versionId: null,
-      fileName: 'cover-letter.pdf', mimeType: 'application/pdf', encryptionKeyRef: 'S3_MANAGED',
+      fileName: 'cover-letter.pdf', mimeType: 'application/pdf', encryptionKeyRef: 'S3_MANAGED', approvalStatus: 'APPROVED', approvedAt: new Date('2026-09-14T00:00:00.000Z'), approvedBy: 'user-1',
       checksumSha256: 'c'.repeat(64), byteSize: BigInt(22), scanStatus: 'CLEAN', deletedAt: null, expiresAt: null,
     };
     transaction.submissionAuthorization.findFirst.mockResolvedValue({
@@ -172,6 +206,7 @@ describe('ProviderSubmissionService', () => {
           fileName: coverLetterDocument.fileName, mimeType: coverLetterDocument.mimeType,
           byteSize: coverLetterDocument.byteSize.toString(), checksumSha256: coverLetterDocument.checksumSha256,
           encryptionKeyRef: coverLetterDocument.encryptionKeyRef, scanStatus: coverLetterDocument.scanStatus,
+          approvalStatus: coverLetterDocument.approvalStatus, approvedAt: coverLetterDocument.approvedAt.toISOString(), approvedBy: coverLetterDocument.approvedBy,
         },
       },
       application: { ...authorization.application, documents: [{ type: 'cover_letter', objectMetadata: coverLetterDocument }] },
@@ -218,6 +253,7 @@ describe('ProviderSubmissionService', () => {
         questionsNormalized: [{ externalKey: approvedIdentity, answers: [
           { id: 'answer-1', userId: 'user-1', value: 'Approved response', source: 'USER_INPUT', approved: true, approvedAt: new Date('2026-09-14T00:00:00Z'), approvedBy: 'user-1', provenance: { source: 'USER_INPUT' }, version: 2 },
           { id: 'answer-cover', userId: 'user-1', value: { source: 'coverLetter' }, source: 'COVER_LETTER', approved: true, approvedAt: new Date('2026-09-14T00:00:00Z'), approvedBy: 'user-1', provenance: { source: 'COVER_LETTER' }, version: 1 },
+          { id: 'profile-scalar', userId: 'user-1', value: 'forged profile value', source: 'USER_PROFILE', approved: true, approvedAt: new Date('2026-09-14T00:00:00Z'), approvedBy: 'user-1', provenance: { source: 'USER_PROFILE' }, version: 9 },
         ] }],
       },
     });
@@ -230,6 +266,24 @@ describe('ProviderSubmissionService', () => {
       expect.objectContaining({ answerId: 'answer-1', questionIdentity: approvedIdentity, ownerId: 'user-1', value: 'Approved response', approved: true }),
       expect.objectContaining({ answerId: 'answer-cover', value: 'Approved cover letter text', source: 'COVER_LETTER' }),
     ]), 'user-1');
+    expect(fillCurrentStep.mock.calls[0]?.[2]).not.toEqual(expect.arrayContaining([expect.objectContaining({ answerId: 'profile-scalar' })]));
+  });
+
+  it('fills an approved cover-letter textarea and resolves its required blocker', async () => {
+    transaction.submissionAuthorization.findFirst.mockResolvedValue({
+      ...authorization,
+      application: { ...authorization.application, coverLetter: { userId: 'user-1', content: 'Approved cover letter text' } },
+    });
+    fillCurrentStep.mockClear().mockResolvedValue({ advanced: false, validationErrors: [], requiredBlockingFieldIds: ['resume', 'cover-letter-text'], fields: [
+      { id: 'resume', kind: 'FILE', name: 'resume', label: 'Resume' },
+      { id: 'cover-letter-text', kind: 'TEXTAREA', name: 'cover_letter', label: 'Cover letter' },
+    ] });
+    const fixture = pageFixture();
+    const subject = service(fixture.page);
+
+    await expect(subject.service.execute(input())).resolves.toMatchObject({ provider: 'GREENHOUSE' });
+    expect(subject.fill).toHaveBeenCalledWith('cover-letter-text', 'Approved cover letter text');
+    expect(fixture.submit.first).toHaveBeenCalledOnce();
   });
 
   it('refuses execution when the authorized document checksum changed', async () => {
@@ -338,6 +392,51 @@ describe('ProviderSubmissionService', () => {
     expect(fillCurrentStep).toHaveBeenCalledTimes(2);
     expect(fixture.upload.setInputFiles).toHaveBeenCalledOnce();
     expect(fixture.submit.first).toHaveBeenCalledOnce();
+  });
+
+  it('advances a step whose only blocker was the resume upload this submission supplied', async () => {
+    transaction.submissionAuthorization.findFirst.mockResolvedValue(authorization);
+    fillCurrentStep.mockClear();
+    fillCurrentStep
+      // The adapter decides completion before the authorized document is attached, so a
+      // step whose only blocker is the resume control reports advanced:false. Trusting that
+      // verdict aborted the submission after a successful upload, which made every
+      // multi-step provider form with a resume upload impossible to submit.
+      .mockResolvedValueOnce({
+        stepIdentity: 'step-1', step: 1, advanced: false, hasNextStep: true, validationErrors: [],
+        requiredBlockingFieldIds: ['resume'], filledFieldIds: [], assessments: [],
+        fields: [{ id: 'resume', kind: 'FILE', name: 'resume', label: 'Resume' }],
+      })
+      .mockResolvedValueOnce({
+        stepIdentity: 'step-2', step: 2, advanced: false, hasNextStep: false, validationErrors: [],
+        requiredBlockingFieldIds: [], filledFieldIds: [], assessments: [], fields: [],
+      });
+    const fixture = pageFixture();
+    const subject = service(fixture.page);
+
+    await expect(subject.service.execute(input())).resolves.toMatchObject({ provider: 'GREENHOUSE' });
+    expect(fillCurrentStep).toHaveBeenCalledTimes(2);
+    expect(fixture.upload.setInputFiles).toHaveBeenCalledOnce();
+    expect(subject.advance).toHaveBeenCalledOnce();
+    expect(fixture.submit.first).toHaveBeenCalledOnce();
+  });
+
+  it('fails closed when a step still has a blocker this submission could not supply', async () => {
+    transaction.submissionAuthorization.findFirst.mockResolvedValue(authorization);
+    fillCurrentStep.mockClear();
+    fillCurrentStep.mockResolvedValue({
+      stepIdentity: 'step-1', step: 1, advanced: false, hasNextStep: true, validationErrors: [],
+      // A resume control the adapter sees but the page does not expose as a file input:
+      // nothing is uploaded, so the blocker survives and the step must not be advanced.
+      requiredBlockingFieldIds: ['resume'], filledFieldIds: [], assessments: [],
+      fields: [{ id: 'other', kind: 'TEXT', name: 'other', label: 'Other' }],
+    });
+    const fixture = pageFixture();
+    const subject = service(fixture.page);
+
+    await expect(subject.service.execute(input())).rejects.toMatchObject({ code: 'PRECONDITION_FAILED' });
+    expect(subject.advance).not.toHaveBeenCalled();
+    expect(fixture.submit.first).not.toHaveBeenCalled();
   });
 
   it('fails closed when a provider repeats the same step identity', async () => {

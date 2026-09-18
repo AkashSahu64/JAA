@@ -24,7 +24,7 @@ describe('approved cover-letter document transport', () => {
       id: 'cover-object', userId: 'user-1', kind: 'COVER_LETTER', resumeVersionId: null,
       bucket: 'private', objectKey: 'private/cover_letter/user-1/' + 'd'.repeat(64), versionId: null,
       fileName: 'cover-letter.pdf', mimeType: 'application/pdf', checksumSha256: 'd'.repeat(64),
-      byteSize: BigInt(20), scanStatus: 'CLEAN', deletedAt: null, expiresAt: null,
+      byteSize: BigInt(20), scanStatus: 'CLEAN', deletedAt: null, expiresAt: null, approvalStatus: 'APPROVED', approvedAt: new Date('2026-09-14T00:00:00Z'), approvedBy: 'user-1',
     };
     const storage = { readAuthorized: vi.fn(async () => ({ buffer: Buffer.from('%PDF-cover'), fileName: document.fileName, mimeType: 'application/pdf' as const })) };
     const result = {
@@ -54,6 +54,26 @@ describe('approved cover-letter document transport', () => {
 });
 
 describe('approved resume document transport', () => {
+  it('fails closed when the exact resume artifact has no owner approval metadata', async () => {
+    const uploadDocument = vi.fn(async () => undefined);
+    const port = { uploadDocument, validate: vi.fn(async () => []) } as unknown as GreenhouseFormPort;
+    const document = {
+      id: 'resume-object', userId: 'user-1', kind: 'RESUME_APPROVED', resumeVersionId: 'version-1',
+      bucket: 'private', objectKey: 'private/resume_approved/user-1/' + 'e'.repeat(64), versionId: null,
+      fileName: 'resume.pdf', mimeType: 'application/pdf', checksumSha256: 'e'.repeat(64), byteSize: BigInt(20),
+      scanStatus: 'CLEAN', deletedAt: null, expiresAt: null,
+    };
+    const storage = { readAuthorized: vi.fn() };
+    const result = {
+      step: 1, stepIdentity: 'step-1', hasNextStep: false, fields: [{ id: 'resume', name: 'resume', label: 'Resume', kind: 'FILE', required: true }],
+      filledFieldIds: [], requiredBlockingFieldIds: ['resume'], assessments: [], validationErrors: [], advanced: false,
+    } as GreenhouseFillResult;
+    const updated = await fillApprovedResumeDocument(port, result, document, 'version-1', 'user-1', storage);
+    expect(storage.readAuthorized).not.toHaveBeenCalled();
+    expect(uploadDocument).not.toHaveBeenCalled();
+    expect(updated.requiredBlockingFieldIds).toEqual(['resume']);
+  });
+
   it('fails closed when multiple resume file controls are present', async () => {
     const uploadDocument = vi.fn(async () => undefined);
     const port = { uploadDocument, validate: vi.fn(async () => []) } as unknown as GreenhouseFormPort;
@@ -61,7 +81,7 @@ describe('approved resume document transport', () => {
       id: 'resume-object', userId: 'user-1', kind: 'RESUME_APPROVED', resumeVersionId: 'version-1',
       bucket: 'private', objectKey: 'private/resume_approved/user-1/' + 'e'.repeat(64), versionId: null,
       fileName: 'resume.pdf', mimeType: 'application/pdf', checksumSha256: 'e'.repeat(64),
-      byteSize: BigInt(20), scanStatus: 'CLEAN', deletedAt: null, expiresAt: null,
+      byteSize: BigInt(20), scanStatus: 'CLEAN', deletedAt: null, expiresAt: null, approvalStatus: 'APPROVED', approvedAt: new Date('2026-09-14T00:00:00Z'), approvedBy: 'user-1',
     };
     const storage = { readAuthorized: vi.fn(async () => ({ buffer: Buffer.from('%PDF-resume'), fileName: 'resume.pdf', mimeType: 'application/pdf' as const })) };
     const result = {

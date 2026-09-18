@@ -1,10 +1,14 @@
-import { describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { AutomationJobHandlerContext } from './automation-worker';
 import { createProductionAutomationJobHandlers } from './automation-job-handlers';
 import { AutomationJobRetryError } from './automation-jobs';
 
 const ingestEmailOutcome = vi.hoisted(() => vi.fn(async () => undefined));
 vi.mock('./email-outcomes', () => ({ ingestEmailOutcome }));
+const syncEmailConnection = vi.hoisted(() => vi.fn(async () => undefined));
+vi.mock('./email-sync', () => ({ syncEmailConnection }));
+const createMailboxConnector = vi.hoisted(() => vi.fn(() => ({ provider: 'GMAIL', listMessages: vi.fn() })));
+vi.mock('./email-connectors', () => ({ createMailboxConnector }));
 const verifySubmission = vi.hoisted(() => vi.fn(async () => undefined));
 vi.mock('./submission-verification', () => ({ verifySubmission }));
 
@@ -24,7 +28,26 @@ function context(): AutomationJobHandlerContext {
   };
 }
 
+beforeEach(() => {
+  createMailboxConnector.mockClear();
+  syncEmailConnection.mockClear();
+  ingestEmailOutcome.mockClear();
+  verifySubmission.mockClear();
+});
+
 describe('human-verification resume automation job handler', () => {
+  it('runs an owner-scoped provider mailbox sync through the shared connector boundary', async () => {
+    const handler = createProductionAutomationJobHandlers().get('SYNC_EMAIL_CONNECTION')!;
+    await expect(handler({ ...context(), type: 'SYNC_EMAIL_CONNECTION', payload: { connectionId: 'connection-1', provider: 'GMAIL' } })).resolves.toBeUndefined();
+    expect(createMailboxConnector).toHaveBeenCalledWith({ userId: 'user', provider: 'GMAIL' });
+    expect(syncEmailConnection).toHaveBeenCalledWith(expect.objectContaining({ userId: 'user', connectionId: 'connection-1', correlationId: 'run', connector: expect.any(Object) }));
+  });
+
+  it('rejects unsupported mailbox providers before connector creation', async () => {
+    const handler = createProductionAutomationJobHandlers().get('SYNC_EMAIL_CONNECTION')!;
+    await expect(handler({ ...context(), type: 'SYNC_EMAIL_CONNECTION', payload: { connectionId: 'connection-1', provider: 'IMAP' } })).rejects.toThrow('provider is invalid');
+    expect(createMailboxConnector).not.toHaveBeenCalled();
+  });
   it('ingests provider-fetched email data through the bounded hash-only service', async () => {
     const handler = createProductionAutomationJobHandlers().get('EMAIL_OUTCOME')!;
     const handlerContext = { ...context(), type: 'EMAIL_OUTCOME', payload: {

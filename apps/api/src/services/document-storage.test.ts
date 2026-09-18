@@ -294,7 +294,7 @@ describe('document storage validation', () => {
     const document = { id: 'application-document-1', applicationId: 'application-1', objectMetadataId: 'object-1', type: 'resume', fileName: 'resume.pdf', filePath: 'private/resume_tailored/user-1/' + 'a'.repeat(64), mimeType: 'application/pdf', uploadedAt: new Date() };
     const tx = {
       application: { findFirst: vi.fn(async () => ({ id: 'application-1', resumeVersionId: 'version-1' })) },
-      objectMetadata: { findFirst: vi.fn(async () => ({ id: 'object-1', userId: 'user-1', resumeVersionId: 'version-1', kind: 'RESUME_TAILORED', bucket: 'private', objectKey: document.filePath, versionId: null, scanStatus: 'CLEAN', deletedAt: null, fileName: 'resume.pdf', mimeType: 'application/pdf', checksumSha256: 'a'.repeat(64), byteSize: BigInt(42) })) },
+      objectMetadata: { findFirst: vi.fn(async () => ({ id: 'object-1', userId: 'user-1', resumeVersionId: 'version-1', kind: 'RESUME_TAILORED', bucket: 'private', objectKey: document.filePath, versionId: null, scanStatus: 'CLEAN', deletedAt: null, fileName: 'resume.pdf', mimeType: 'application/pdf', checksumSha256: 'a'.repeat(64), byteSize: BigInt(42), encryptionKeyRef: 'S3_MANAGED', approvalStatus: 'APPROVED', approvedAt: new Date(), approvedBy: 'user-1' })) },
       applicationDocument: { findFirst: vi.fn<() => Promise<typeof document | null>>(async () => null), create: vi.fn(async () => document) },
       auditLog: { create: vi.fn(async () => undefined) },
     };
@@ -321,11 +321,23 @@ describe('document storage validation', () => {
     expect(tx.applicationDocument.create).not.toHaveBeenCalled();
   });
 
+  it('does not attach a document with an invalid approval timestamp', async () => {
+    const tx = {
+      application: { findFirst: vi.fn(async () => ({ id: 'application-1', resumeVersionId: 'version-1' })) },
+      objectMetadata: { findFirst: vi.fn(async () => ({ id: 'object-1', userId: 'user-1', resumeVersionId: 'version-1', kind: 'RESUME_TAILORED', bucket: 'private', objectKey: 'private/resume_tailored/user-1/' + 'a'.repeat(64), versionId: null, scanStatus: 'CLEAN', deletedAt: null, expiresAt: null, approvalStatus: 'APPROVED', approvedAt: new Date(Number.NaN), approvedBy: 'user-1', fileName: 'resume.pdf', mimeType: 'application/pdf', checksumSha256: 'a'.repeat(64), byteSize: BigInt(42), encryptionKeyRef: 'S3_MANAGED' })) },
+      applicationDocument: { findFirst: vi.fn(), create: vi.fn() },
+    };
+    await expect(attachDocumentToApplicationInTransaction(tx as never, {
+      userId: 'user-1', applicationId: 'application-1', resumeVersionId: 'version-1', objectMetadataId: 'object-1', type: 'resume',
+    })).rejects.toMatchObject({ code: 'INVALID_DOCUMENT' } satisfies Partial<DocumentStorageError>);
+    expect(tx.applicationDocument.create).not.toHaveBeenCalled();
+  });
+
   it('replays an application binding when a concurrent unique insert wins the race', async () => {
     const document = { id: 'application-document-1', applicationId: 'application-1', objectMetadataId: 'object-1', type: 'other', fileName: 'evidence.png', filePath: 'private/screenshot/user-1/' + 'a'.repeat(64), mimeType: 'image/png', uploadedAt: new Date() };
     const tx = {
       application: { findFirst: vi.fn(async () => ({ id: 'application-1', resumeVersionId: 'version-1' })) },
-      objectMetadata: { findFirst: vi.fn(async () => ({ id: 'object-1', userId: 'user-1', resumeVersionId: 'version-1', kind: 'SCREENSHOT', bucket: 'private', objectKey: document.filePath, versionId: null, scanStatus: 'CLEAN', deletedAt: null, fileName: 'evidence.png', mimeType: 'image/png', checksumSha256: 'a'.repeat(64), byteSize: BigInt(42) })) },
+      objectMetadata: { findFirst: vi.fn(async () => ({ id: 'object-1', userId: 'user-1', resumeVersionId: 'version-1', kind: 'SCREENSHOT', bucket: 'private', objectKey: document.filePath, versionId: null, scanStatus: 'CLEAN', deletedAt: null, fileName: 'evidence.png', mimeType: 'image/png', checksumSha256: 'a'.repeat(64), byteSize: BigInt(42), encryptionKeyRef: 'S3_MANAGED', approvalStatus: 'APPROVED', approvedAt: new Date(), approvedBy: 'user-1' })) },
       applicationDocument: { findFirst: vi.fn().mockResolvedValueOnce(null).mockResolvedValueOnce(document), create: vi.fn().mockRejectedValueOnce(new Prisma.PrismaClientKnownRequestError('unique', { code: 'P2002', clientVersion: '5.22.0' })) },
       auditLog: { create: vi.fn() },
     };
@@ -369,8 +381,23 @@ describe('document storage validation', () => {
     expect(tx.applicationDocument.create).not.toHaveBeenCalled();
   });
 
+  it('rejects an exact document with malformed expiry metadata', async () => {
+    const tx = {
+      application: { findFirst: vi.fn(async () => ({ id: 'application-1', resumeVersionId: 'version-1' })) },
+      objectMetadata: { findFirst: vi.fn(async () => ({ id: 'object-1', userId: 'user-1', resumeVersionId: 'version-1', kind: 'RESUME_TAILORED', bucket: 'private', objectKey: 'private/resume_tailored/user-1/' + 'a'.repeat(64), versionId: null, scanStatus: 'CLEAN', deletedAt: null, expiresAt: new Date(Number.NaN), approvalStatus: 'APPROVED', approvedAt: new Date(), approvedBy: 'user-1', fileName: 'resume.pdf', mimeType: 'application/pdf', checksumSha256: 'a'.repeat(64), byteSize: BigInt(42), encryptionKeyRef: 'S3_MANAGED' })) },
+      applicationDocument: { findFirst: vi.fn(), create: vi.fn() },
+    };
+    await expect(attachDocumentToApplicationInTransaction(tx as never, {
+      userId: 'user-1', applicationId: 'application-1', resumeVersionId: 'version-1', objectMetadataId: 'object-1', type: 'resume',
+    })).rejects.toMatchObject({ code: 'INVALID_DOCUMENT' } satisfies Partial<DocumentStorageError>);
+    expect(tx.applicationDocument.create).not.toHaveBeenCalled();
+  });
+
   it('returns only a stored document whose metadata, content, and checksum agree', async () => {
-    const client = { send: async () => ({ ServerSideEncryption: 'AES256', Body: { transformToByteArray: async () => pdf } }) };
+    let calls = 0;
+    const client = { send: async () => ++calls === 1
+      ? { ContentLength: pdf.length, ContentType: 'application/pdf', Metadata: { sha256: 'f581fc87f30296eff11777c3ce1b9a8b7077071ad8abedfcba317fef0c807224' }, ServerSideEncryption: 'AES256' }
+      : { ServerSideEncryption: 'AES256', Body: { transformToByteArray: async () => pdf } } };
     const storage = new DocumentStorage(cleanScanner, () => ({ bucket: 'private', client: client as never, encryptionKeyRef: 'S3_MANAGED' }));
 
     await expect(storage.readVerified({
@@ -381,12 +408,25 @@ describe('document storage validation', () => {
 
   it('treats hexadecimal checksum casing consistently at the verified-read boundary', async () => {
     const checksum = 'f581fc87f30296eff11777c3ce1b9a8b7077071ad8abedfcba317fef0c807224';
-    const client = { send: async () => ({ ServerSideEncryption: 'AES256', Body: { transformToByteArray: async () => pdf } }) };
+    let calls = 0;
+    const client = { send: async () => ++calls === 1
+      ? { ContentLength: pdf.length, ContentType: 'application/pdf', Metadata: { sha256: checksum }, ServerSideEncryption: 'AES256' }
+      : { ServerSideEncryption: 'AES256', Body: { transformToByteArray: async () => pdf } } };
     const storage = new DocumentStorage(cleanScanner, () => ({ bucket: 'private', client: client as never, encryptionKeyRef: 'S3_MANAGED' }));
     await expect(storage.readVerified({
       bucket: 'private', objectKey: `private/resume_source/user-1/${checksum.toUpperCase()}`, fileName: 'resume.pdf', mimeType: 'application/pdf',
       checksumSha256: checksum.toUpperCase(), byteSize: BigInt(pdf.length), encryptionKeyRef: 'S3_MANAGED',
     })).resolves.toEqual({ buffer: pdf, fileName: 'resume.pdf', mimeType: 'application/pdf' });
+  });
+
+  it('rejects an object whose integrity metadata is incomplete', async () => {
+    const storage = new DocumentStorage(cleanScanner, () => ({
+      bucket: 'private', client: { send: vi.fn(async () => ({ ServerSideEncryption: 'AES256' })) } as never, encryptionKeyRef: 'S3_MANAGED',
+    }));
+    await expect(storage.readVerified({
+      bucket: 'private', objectKey: 'private/resume_source/user-1/' + 'f581fc87f30296eff11777c3ce1b9a8b7077071ad8abedfcba317fef0c807224', fileName: 'resume.pdf', mimeType: 'application/pdf',
+      checksumSha256: 'f581fc87f30296eff11777c3ce1b9a8b7077071ad8abedfcba317fef0c807224', byteSize: BigInt(pdf.length), encryptionKeyRef: 'S3_MANAGED',
+    })).rejects.toMatchObject({ code: 'INVALID_DOCUMENT' } satisfies Partial<DocumentStorageError>);
   });
 
   it('refuses to read an object whose server-side encryption changed', async () => {
@@ -447,6 +487,13 @@ describe('document storage validation', () => {
     await expect(storage.signedDownloadUrl('user-1', publicReference)).rejects.toMatchObject({ code: 'INVALID_DOCUMENT' });
   });
 
+  it.each(['.', '..', 'owner/other', 'owner\\other', 'owner\nother'])('rejects ambiguous or unsafe owner path segments: %j', userId => {
+    expect(() => validateStoredDocumentMetadata({
+      userId, bucket: 'private', objectKey: `private/resume_source/${userId}/${'a'.repeat(64)}`,
+      fileName: 'resume.pdf', mimeType: 'application/pdf', checksumSha256: 'a'.repeat(64), byteSize: BigInt(pdf.length),
+    })).toThrow(DocumentStorageError);
+  });
+
   it('treats an already-absent object as a successful idempotent deletion', async () => {
     const storage = new DocumentStorage(cleanScanner, () => ({
       bucket: 'private',
@@ -490,6 +537,15 @@ describe('document storage validation', () => {
       userId: 'user-1', bucket: 'private', objectKey: 'private/resume_source/user-1/' + 'a'.repeat(64),
       fileName: 'resume.pdf', mimeType: 'application/pdf', checksumSha256: 'a'.repeat(64), byteSize: BigInt(42),
       encryptionKeyRef: 'S3_MANAGED', approvalStatus: 'APPROVED', approvedAt: new Date(), approvedBy: 'user-1', scanStatus: 'CLEAN',
+    })).rejects.toMatchObject({ code: 'INVALID_DOCUMENT' } satisfies Partial<DocumentStorageError>);
+  });
+
+  it('rejects an approved worker reference with an invalid approval timestamp', async () => {
+    const storage = new DocumentStorage(cleanScanner, () => { throw new Error('object access must not be reached'); });
+    await expect(storage.readAuthorized('user-1', {
+      userId: 'user-1', kind: 'RESUME_SOURCE', bucket: 'private', objectKey: 'private/resume_source/user-1/' + 'a'.repeat(64),
+      fileName: 'resume.pdf', mimeType: 'application/pdf', checksumSha256: 'a'.repeat(64), byteSize: BigInt(42),
+      encryptionKeyRef: 'S3_MANAGED', approvalStatus: 'APPROVED', approvedAt: new Date(Number.NaN), approvedBy: 'user-1', scanStatus: 'CLEAN',
     })).rejects.toMatchObject({ code: 'INVALID_DOCUMENT' } satisfies Partial<DocumentStorageError>);
   });
 

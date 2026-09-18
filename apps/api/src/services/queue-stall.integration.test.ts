@@ -77,7 +77,10 @@ describeStall.sequential('BullMQ lock-loss recovery', () => {
   it('rejects stale completion after real BullMQ lock loss and records one recovered success', async () => {
     const created = await createAutomationJob({
       userId,
-      type: 'APPLICATION_QUEUE_STALL_FIXTURE',
+      // A real `applications`-routed type: this test supplies its own worker handler, and
+      // job routing is exact-match, so an invented type would be quarantined on
+      // `maintenance` and the worker under test would never see the job.
+      type: 'VERIFY_SUBMISSION_CONFIRMATION',
       payload: { target: 'https://jobs.example.invalid/stalled-fixture' },
       correlationId: randomUUID(),
       idempotencyKey: `queue-stall:${randomUUID()}`,

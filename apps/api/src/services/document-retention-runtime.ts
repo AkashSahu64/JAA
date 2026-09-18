@@ -1,6 +1,8 @@
 import { DocumentStorage } from './document-storage';
 import { purgeExpiredDocuments, type DocumentRetentionResult } from './document-retention';
 
+const MAX_RETENTION_SHUTDOWN_TIMEOUT_MS = 120_000;
+
 export interface DocumentRetentionRuntimeOptions {
   intervalMs?: number;
   shutdownTimeoutMs?: number;
@@ -21,7 +23,7 @@ export class DocumentRetentionRuntime {
     this.intervalMs = options.intervalMs ?? 60 * 60 * 1_000;
     this.shutdownTimeoutMs = options.shutdownTimeoutMs ?? 30_000;
     if (!Number.isSafeInteger(this.intervalMs) || this.intervalMs < 1_000) throw new Error('Document retention interval must be at least one second');
-    if (!Number.isSafeInteger(this.shutdownTimeoutMs) || this.shutdownTimeoutMs < 1_000) throw new Error('Document retention shutdown timeout must be at least one second');
+    if (!Number.isSafeInteger(this.shutdownTimeoutMs) || this.shutdownTimeoutMs < 1_000 || this.shutdownTimeoutMs > MAX_RETENTION_SHUTDOWN_TIMEOUT_MS) throw new Error('Document retention shutdown timeout must be between one second and two minutes');
     this.storage = options.storage ?? new DocumentStorage();
     this.onError = options.onError ?? (() => undefined);
   }

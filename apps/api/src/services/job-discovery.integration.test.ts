@@ -192,6 +192,18 @@ describeDatabase.sequential('job discovery database integration', () => {
       jobId: firstItem.jobId, duplicateOfJobId: firstItem.jobId,
     });
     expect(items.some((item) => item.sourceIdentity === sameIdentity.sourceJobId && item.pageNumber === 1)).toBe(false);
+
+    const persistedJobIds = items.flatMap((item) => item.jobId ? [item.jobId] : []);
+    const analysisJobs = (await prisma.automationJob.findMany({
+      where: { userId, type: 'ANALYZE_JOB', idempotencyKey: { startsWith: 'analyze-job:' } },
+      orderBy: { id: 'asc' },
+      select: { payload: true, idempotencyKey: true },
+    })).filter((automationJob) => persistedJobIds.includes((automationJob.payload as { jobId?: string }).jobId ?? ''));
+    expect(analysisJobs).toHaveLength(2);
+    expect(analysisJobs).toEqual(expect.arrayContaining([
+      expect.objectContaining({ payload: { jobId: firstItem.jobId }, idempotencyKey: expect.stringMatching(/^analyze-job:/) }),
+      expect.objectContaining({ payload: { jobId: items.find((item) => item.sourceIdentity === unique.sourceJobId)?.jobId }, idempotencyKey: expect.stringMatching(/^analyze-job:/) }),
+    ]));
   });
 
   it('resolves concurrent account-qualified fingerprint ingestion deterministically', async () => {

@@ -4,12 +4,14 @@ import { transitionApplicationInTenant } from './application-state-machine';
 import { ProviderSubmissionError, ProviderSubmissionService } from './provider-submission';
 import { DocumentStorageError, validateStoredDocumentMetadata } from './document-storage';
 import { safeErrorMessage } from '../observability/structured-log';
+import { validateSubmissionVerificationEvidence, SubmissionVerificationError } from './submission-verification';
 
 const authorizationLifetimeMs = 10 * 60 * 1000;
 const activeVerificationStatuses = ['PENDING', 'EXPIRED'];
 const maxReviewedAnswerTextLength = 20_000;
 const maxReviewedAnswerOptions = 100;
 const maxReviewedAnswerOptionLength = 500;
+const approvedProfileKeys = new Set(['firstName', 'lastName', 'email', 'phone', 'location', 'linkedinUrl', 'websiteUrl']);
 
 export function safeSubmissionFailureMessage(error: unknown): string {
   return safeErrorMessage(error, 500);
@@ -45,15 +47,31 @@ export interface ExecuteAuthorizedSubmissionInput {
 }
 
 type ProviderExecutionResult = Awaited<ReturnType<ProviderSubmissionService['execute']>>;
+type SubmissionProvider = 'GREENHOUSE' | 'LEVER';
 
-export function validateProviderExecutionResult(result: unknown, applicationId: string): asserts result is ProviderExecutionResult {
+function submissionProviderForSource(source: unknown): SubmissionProvider {
+  if (typeof source === 'string') {
+    const normalized = source.trim().toUpperCase();
+    if (normalized === 'GREENHOUSE' || normalized === 'LEVER') return normalized;
+  }
+  throw new ProviderSubmissionError('UNKNOWN_OUTCOME', 'Authorized application has no certified provider identity');
+}
+
+export function validateProviderExecutionResult(result: unknown, applicationId: string, expectedProvider?: SubmissionProvider, now = new Date()): asserts result is ProviderExecutionResult {
   if (!result || typeof result !== 'object' || Array.isArray(result)) {
     throw new ProviderSubmissionError('UNKNOWN_OUTCOME', 'Provider execution returned malformed outcome data');
   }
   const candidate = result as Partial<ProviderExecutionResult>;
-  if ((candidate.provider !== 'GREENHOUSE' && candidate.provider !== 'LEVER')
-    || !(candidate.attemptedAt instanceof Date) || !Number.isFinite(candidate.attemptedAt.getTime())
-    || candidate.attemptedAt.getTime() > Date.now() + 5 * 60 * 1000) {
+  if (candidate.provider !== 'GREENHOUSE' && candidate.provider !== 'LEVER') {
+    throw new ProviderSubmissionError('UNKNOWN_OUTCOME', 'Provider execution returned unverifiable outcome metadata');
+  }
+  if (expectedProvider !== undefined && candidate.provider !== expectedProvider) {
+    throw new ProviderSubmissionError('UNKNOWN_OUTCOME', 'Provider execution returned mismatched outcome provider');
+  }
+  if (!(candidate.attemptedAt instanceof Date) || !Number.isFinite(candidate.attemptedAt.getTime())
+    || !(now instanceof Date) || !Number.isFinite(now.getTime())
+    || candidate.attemptedAt.getTime() < now.getTime() - 5 * 60 * 1000
+    || candidate.attemptedAt.getTime() > now.getTime() + 5 * 60 * 1000) {
     throw new ProviderSubmissionError('UNKNOWN_OUTCOME', 'Provider execution returned unverifiable outcome metadata');
   }
   if (candidate.confirmation !== undefined
@@ -63,6 +81,16 @@ export function validateProviderExecutionResult(result: unknown, applicationId: 
       || !Number.isFinite(candidate.confirmation.observedAt.getTime())
       || candidate.confirmation.observedAt.getTime() < candidate.attemptedAt.getTime())) {
     throw new ProviderSubmissionError('UNKNOWN_OUTCOME', 'Provider execution returned inconsistent confirmation evidence');
+  }
+  if (candidate.confirmation !== undefined) {
+    try {
+      validateSubmissionVerificationEvidence(candidate.confirmation);
+    } catch (error) {
+      if (error instanceof SubmissionVerificationError) {
+        throw new ProviderSubmissionError('UNKNOWN_OUTCOME', 'Provider execution returned unverifiable confirmation evidence');
+      }
+      throw error;
+    }
   }
 }
 
@@ -108,19 +136,29 @@ export function isReviewedApplicationAnswer(
     || answer.approvedBy !== ownerId || !['USER_PROFILE', 'USER_INPUT', 'COVER_LETTER', 'AI_SUGGESTION'].includes(answer.source)
     || (answer.version !== undefined && (!Number.isSafeInteger(answer.version) || answer.version < 1))
     || !answer.provenance || typeof answer.provenance !== 'object' || Array.isArray(answer.provenance)) return false;
-  if (answer.value !== undefined && !isReviewedAnswerValue(answer.value)) return false;
+  if (answer.value !== undefined && !isReviewedAnswerValue(answer.value, answer.source)) return false;
   const provenance = answer.provenance as Record<string, unknown>;
-  return provenance.source === answer.source
+  const sourceReferenceMatches = answer.source === 'USER_PROFILE'
+    ? Boolean(answer.value && typeof answer.value === 'object' && !Array.isArray(answer.value)
+      && (answer.value as Record<string, unknown>).profileKey === provenance.profileKey)
+    : answer.source !== 'COVER_LETTER' || Boolean(answer.value && typeof answer.value === 'object'
+      && !Array.isArray(answer.value) && (answer.value as Record<string, unknown>).source === 'coverLetter');
+  return provenance.source === answer.source && sourceReferenceMatches
     && answer.userId === ownerId
     && answer.approved === true
     && typeof provenance.source === 'string';
 }
 
-function isReviewedAnswerValue(value: Prisma.JsonValue): boolean {
-  return (typeof value === 'string' && value.length <= maxReviewedAnswerTextLength)
-    || typeof value === 'boolean'
-    || (Array.isArray(value) && value.length <= maxReviewedAnswerOptions
-      && value.every(item => typeof item === 'string' && item.length <= maxReviewedAnswerOptionLength));
+function isReviewedAnswerValue(value: Prisma.JsonValue, source: string): boolean {
+  if (typeof value === 'string') return value.length <= maxReviewedAnswerTextLength;
+  if (typeof value === 'boolean') return true;
+  if (Array.isArray(value)) return value.length <= maxReviewedAnswerOptions
+    && value.every(item => typeof item === 'string' && item.length <= maxReviewedAnswerOptionLength);
+  if (!value || typeof value !== 'object') return false;
+  const record = value as Record<string, unknown>;
+  if (source === 'USER_PROFILE') return Object.keys(record).length === 1
+    && typeof record.profileKey === 'string' && approvedProfileKeys.has(record.profileKey);
+  return source === 'COVER_LETTER' && Object.keys(record).length === 1 && record.source === 'coverLetter';
 }
 
 type ReviewableApplicationAnswer = {
@@ -223,7 +261,7 @@ export async function authorizeSubmission(input: AuthorizeSubmissionInput) {
     const approvedResumeArtifact = document && ['RESUME_SOURCE', 'RESUME_APPROVED', 'RESUME_TAILORED'].includes(document.kind);
     if (!document || !exactDocument || !approvedResumeArtifact || document.userId !== input.userId
       || !document.objectKey.startsWith('private/') || !/^[a-f0-9]{64}$/i.test(document.checksumSha256)
-      || document.approvalStatus !== 'APPROVED' || !document.approvedAt || document.approvedBy !== input.userId
+      || document.approvalStatus !== 'APPROVED' || !(document.approvedAt instanceof Date) || !Number.isFinite(document.approvedAt.getTime()) || document.approvedBy !== input.userId
       || document.scanStatus !== 'CLEAN' || !document.encryptionKeyRef || document.deletedAt || (document.expiresAt && document.expiresAt <= now)) {
       throw new SubmissionEngineError('PRECONDITION_FAILED', 'Required resume document is unavailable, expired, or not clean');
     }
@@ -238,7 +276,7 @@ export async function authorizeSubmission(input: AuthorizeSubmissionInput) {
     const coverLetterDocument = coverLetterDocuments[0]?.objectMetadata;
     if (coverLetterDocument) {
       if (coverLetterDocument.userId !== input.userId || coverLetterDocument.resumeVersionId !== application.resumeVersionId || coverLetterDocument.kind !== 'COVER_LETTER'
-          || coverLetterDocument.approvalStatus !== 'APPROVED' || !coverLetterDocument.approvedAt || coverLetterDocument.approvedBy !== input.userId
+          || coverLetterDocument.approvalStatus !== 'APPROVED' || !(coverLetterDocument.approvedAt instanceof Date) || !Number.isFinite(coverLetterDocument.approvedAt.getTime()) || coverLetterDocument.approvedBy !== input.userId
         || coverLetterDocument.scanStatus !== 'CLEAN'
         || coverLetterDocument.deletedAt || (coverLetterDocument.expiresAt && coverLetterDocument.expiresAt <= now)) {
         throw new SubmissionEngineError('PRECONDITION_FAILED', 'Cover-letter document is unavailable, expired, or not clean');
@@ -286,15 +324,36 @@ export async function authorizeSubmission(input: AuthorizeSubmissionInput) {
 
 async function claimAuthorizedSubmission(input: ExecuteAuthorizedSubmissionInput) {
   const now = validNow(input.now);
-  return withTenant(input.userId, async tx => {
+  const claimed = await withTenant(input.userId, async tx => {
     await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`${input.userId}:submission-authorization:${input.authorizationId}`}, 0))`;
-    const authorization = await tx.submissionAuthorization.findFirst({ where: { id: input.authorizationId, userId: input.userId }, include: { application: true } });
+    const authorization = await tx.submissionAuthorization.findFirst({ where: { id: input.authorizationId, userId: input.userId }, include: { application: { include: { job: true } } } });
     if (!authorization) throw new SubmissionEngineError('NOT_FOUND', 'Submission authorization not found');
-    if (authorization.status === 'CONSUMED') return { authorization, replayed: true as const };
+    const expectedProvider = submissionProviderForSource(authorization.application.job.source);
+    if (authorization.status === 'CONSUMED') return { authorization, expectedProvider, replayed: true as const };
     if (authorization.status === 'OUTCOME_UNKNOWN') throw new SubmissionEngineError('UNKNOWN_OUTCOME', 'The prior authorized provider submission has an unknown outcome and must be independently reconciled');
     if (authorization.status !== 'AUTHORIZED' || authorization.expiresAt <= now) {
-      if (authorization.status === 'AUTHORIZED') await tx.submissionAuthorization.update({ where: { id: authorization.id }, data: { status: 'EXPIRED' } });
-      throw new SubmissionEngineError('EXPIRED', 'Submission authorization has expired');
+      if (authorization.status === 'AUTHORIZED') {
+        // Expiry before claim is a pre-side-effect condition. Release the
+        // application back to READY_TO_SUBMIT in the same tenant transaction
+        // as the authorization tombstone so it cannot be stranded in
+        // SUBMISSION_PENDING or become re-authorizable halfway through.
+        await transitionApplicationInTenant(tx, {
+          applicationId: authorization.applicationId,
+          userId: input.userId,
+          toStatus: 'READY_TO_SUBMIT',
+          expectedVersion: authorization.application.version,
+          actorType: 'SYSTEM',
+          reason: 'Submission authorization expired before provider execution was claimed',
+          idempotencyKey: `submission-authorization-expired:${authorization.id}`,
+          correlationId: authorization.correlationId,
+          metadata: { authorizationId: authorization.id, expiredAt: now.toISOString() },
+        });
+        await tx.submissionAuthorization.update({ where: { id: authorization.id }, data: { status: 'EXPIRED' } });
+      }
+      // Do not throw inside this transaction: that would roll back the safe
+      // return-to-authorization-gate transition above. The caller throws after
+      // the transaction commits.
+      return { expired: true as const };
     }
     if (authorization.application.status !== 'SUBMISSION_PENDING' || authorization.application.version !== authorization.applicationVersion + 1) {
       throw new SubmissionEngineError('CONFLICT', 'Application no longer matches its authorized submission');
@@ -318,8 +377,12 @@ async function claimAuthorizedSubmission(input: ExecuteAuthorizedSubmissionInput
       },
       select: { id: true },
     });
-    return { authorization: executing, attemptId: attempt.id, replayed: false as const };
+    return { authorization: executing, expectedProvider, attemptId: attempt.id, replayed: false as const };
   });
+  if ('expired' in claimed && claimed.expired) {
+    throw new SubmissionEngineError('EXPIRED', 'Submission authorization has expired');
+  }
+  return claimed;
 }
 
 export async function executeAuthorizedSubmission(input: ExecuteAuthorizedSubmissionInput, executor: SubmissionExecutor = new ProviderSubmissionService()) {
@@ -335,7 +398,7 @@ export async function executeAuthorizedSubmission(input: ExecuteAuthorizedSubmis
   try {
     const result = await executor.execute({ userId: input.userId, applicationId: claimed.authorization.applicationId, authorizationId: claimed.authorization.id, correlationId: input.correlationId, workerId: input.workerId });
     providerExecutionCompleted = true;
-    validateProviderExecutionResult(result, claimed.authorization.applicationId);
+    validateProviderExecutionResult(result, claimed.authorization.applicationId, claimed.expectedProvider, now);
     return withTenant(input.userId, async tx => {
       const authorization = await tx.submissionAuthorization.findFirst({ where: { id: claimed.authorization.id, userId: input.userId }, include: { application: true } });
       if (!authorization || authorization.status !== 'EXECUTING') throw new SubmissionEngineError('CONFLICT', 'Submission authorization is no longer executing');
@@ -468,7 +531,7 @@ export async function reconcileStaleSubmissionAuthorizations(now = new Date(), s
         tx.applicationAttempt.update({ where: { id: attempt.id }, data: { status: 'OUTCOME_UNKNOWN', completedAt: now, error: 'Submission worker became stale before outcome was known', logs: [{ event: 'stale_submission_reconciled', authorizationId: authorization.id, correlationId: authorization.correlationId, independentlyConfirmed: false, ...authorizedDocumentEvidence(authorization.preflightEvidence) }] } }),
         tx.failureRecord.create({ data: { userId: candidate.userId, applicationId: authorization.applicationId, category: 'SUBMISSION', code: 'STALE_EXECUTION', message: 'Submission execution became stale; automatic retry is forbidden', retryable: false, details: { authorizationId: authorization.id, ...authorizedDocumentEvidence(authorization.preflightEvidence) }, correlationId: authorization.correlationId } }),
         tx.auditLog.create({ data: { userId: candidate.userId, action: 'STALE_SUBMISSION_RECONCILED', resource: 'SubmissionAuthorization', resourceId: authorization.id, details: { applicationId: authorization.applicationId, independentlyConfirmed: false } } }),
-        ...(authorization.application.status === 'SUBMISSION_PENDING' ? [] : [tx.outboxEvent.create({ data: { userId: candidate.userId, aggregateType: 'SubmissionAuthorization', aggregateId: authorization.id, eventType: 'submission.outcome.unknown', payload: { applicationId: authorization.applicationId, authorizationId: authorization.id, independentlyConfirmed: false }, schemaVersion: 1, correlationId: authorization.correlationId, idempotencyKey: `submission-outcome-unknown:${authorization.id}` } })]),
+        ...(authorization.application.status === 'SUBMISSION_PENDING' ? [tx.outboxEvent.create({ data: { userId: candidate.userId, aggregateType: 'SubmissionAuthorization', aggregateId: authorization.id, eventType: 'submission.outcome.unknown', payload: { applicationId: authorization.applicationId, authorizationId: authorization.id, independentlyConfirmed: false }, schemaVersion: 1, correlationId: authorization.correlationId, idempotencyKey: `submission-outcome-unknown:${authorization.id}` } })] : []),
       ]);
       return 1;
     });

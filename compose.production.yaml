@@ -1,0 +1,72 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 35s
+    pids_limit: 512
+    env_file: ${PRODUCTION_ENV_FILE:-.env.production}
+    command: ["node_modules/.bin/tsx", "apps/api/src/server.ts"]
+    ports:
+      - "${API_PORT:-3001}:3001"
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m,noexec,nosuid
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3001/api/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      start_period: 15s
+      retries: 6
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 35s
+    pids_limit: 512
+    env_file: ${PRODUCTION_ENV_FILE:-.env.production}
+    command: ["node_modules/.bin/tsx", "apps/api/src/worker.ts"]
+    read_only: true
+    tmpfs:
+      - /tmp:size=512m,noexec,nosuid
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+
+  web:
+    depends_on:
+      api:
+        condition: service_healthy
+    build:
+      context: .
+      dockerfile: Dockerfile
+      # Load .env.production with Compose's --env-file option so this
+      # build-time value is baked into the dashboard bundle.
+      args:
+        VITE_API_BASE_URL: ${VITE_API_BASE_URL:-/api}
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 10s
+    pids_limit: 128
+    command: ["node", "scripts/serve-web.mjs"]
+    ports:
+      - "${WEB_PORT:-4173}:4173"
+    environment:
+      PORT: 4173
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,noexec,nosuid
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:4173/').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      start_period: 10s
+      retries: 6

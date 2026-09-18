@@ -19,18 +19,19 @@ export function errorHandler(
   res: Response,
   _next: NextFunction
 ): void {
+  const normalizedError = err instanceof Error ? err : new Error('Unknown error');
   writeStructuredLog('error', {
     event: 'http.error',
     correlationId: normalizeCorrelationId(_req.header('x-correlation-id')),
     userId: (_req as Request & { user?: { userId?: string } }).user?.userId,
-    errorName: err.name,
-    errorMessage: err.message,
+    errorName: normalizedError.name,
+    errorMessage: normalizedError.message,
   });
   
-  if (err instanceof AppError) {
-    res.status(err.statusCode).json({
+  if (normalizedError instanceof AppError && Number.isInteger(normalizedError.statusCode) && normalizedError.statusCode >= 400 && normalizedError.statusCode <= 499) {
+    res.status(normalizedError.statusCode).json({
       success: false,
-      error: err.message,
+      error: normalizedError.message,
     });
     return;
   }

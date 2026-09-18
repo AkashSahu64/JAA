@@ -56,6 +56,15 @@ describeDatabase.sequential('AutomationJob execution model', () => {
     await expect(createAutomationJob({ ...input, priority: 99 })).rejects.toMatchObject({ code: 'IDEMPOTENCY_CONFLICT' });
   });
 
+  it('replays semantically identical JSON payloads regardless of object key order', async () => {
+    const input = jobInput(userId, { payload: { alpha: { first: 1, second: 2 }, beta: true } });
+    const created = await createAutomationJob(input);
+    await expect(createAutomationJob({
+      ...input,
+      payload: { beta: true, alpha: { second: 2, first: 1 } },
+    })).resolves.toMatchObject({ id: created.id, replayed: true });
+  });
+
   it('serializes concurrent creation by idempotency key', async () => {
     const input = jobInput(userId, { priority: 9 });
     const results = await Promise.all([createAutomationJob(input), createAutomationJob(input)]);

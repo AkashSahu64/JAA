@@ -29,6 +29,9 @@ describeDatabase.sequential('application quality persistence', () => {
   const otherUserId = randomUUID();
   const primary = fixture(userId, 'primary');
   const other = fixture(otherUserId, 'other');
+  // Fixtures created inside individual tests still need cleanup; jobs are not
+  // user-owned, so deleting the candidate does not remove them.
+  const createdJobIds = new Set<string>([primary.jobId, other.jobId]);
 
   beforeAll(async () => {
     await prisma.user.createMany({ data: [
@@ -41,6 +44,7 @@ describeDatabase.sequential('application quality persistence', () => {
 
   afterAll(async () => {
     await prisma.user.deleteMany({ where: { id: { in: [userId, otherUserId] } } });
+    await prisma.job.deleteMany({ where: { id: { in: [...createdJobIds] } } });
     await prisma.$disconnect();
   });
 
@@ -64,6 +68,8 @@ describeDatabase.sequential('application quality persistence', () => {
   it('serializes concurrent PASS decisions against the daily limit', async () => {
     const limited = fixture(userId, 'limited');
     const competing = fixture(userId, 'competing');
+    createdJobIds.add(limited.jobId);
+    createdJobIds.add(competing.jobId);
     await createFixture(limited, 2);
     await createFixture(competing, 2);
     const now = new Date('2026-09-10T12:00:00.000Z');

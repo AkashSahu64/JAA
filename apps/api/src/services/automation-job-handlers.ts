@@ -1,8 +1,8 @@
 import { Prisma } from '@prisma/client';
 import { JobAnalysisAgent } from '@jobagent/ai';
-import { prisma } from '@jobagent/database';
+import { prisma, withTenant } from '@jobagent/database';
 import type { AutomationJobHandler, AutomationJobHandlerContext } from './automation-worker';
-import { executeDiscoveryRun } from './job-discovery';
+import { executeDiscoveryRun, type DiscoveryExecutor } from './job-discovery';
 import { executeJobMatch } from './job-matching';
 import { executeResumeTailoring } from './resume-tailoring';
 import { executeATSEvaluation } from './ats-evaluation';
@@ -10,10 +10,13 @@ import { executeApplicationQuality } from './application-quality';
 import { resumeHumanVerification } from './human-verification';
 import { GreenhouseApplicationService } from './greenhouse-application';
 import { LeverApplicationService } from './lever-application';
-import { AutomationJobRetryError } from './automation-jobs';
+import { AutomationJobRetryError, createAutomationJob } from './automation-jobs';
 import { recordAuthorizedSubmissionHandoff } from './submission-engine';
 import { ingestEmailOutcome } from './email-outcomes';
+import { syncEmailConnection } from './email-sync';
+import { createMailboxConnector } from './email-connectors';
 import { verifySubmission } from './submission-verification';
+import { createApplicationIntent } from './application-creation';
 
 export type AutomationJobHandlerMap = ReadonlyMap<string, AutomationJobHandler>;
 
@@ -55,6 +58,18 @@ async function analyzeJob(context: AutomationJobHandlerContext): Promise<void> {
     update: analysisPersistence(envelope, latencyMs),
     create: { jobId: job.id, ...analysisPersistence(envelope, latencyMs) },
   });
+  // Analysis is a durable pipeline boundary. Queue the deterministic match
+  // only after the validated analysis is persisted; the input hash keeps
+  // retries and re-analysis of the same posting idempotent across runs.
+  await createAutomationJob({
+    userId: context.userId,
+    type: 'MATCH_JOB',
+    payload: { jobId: job.id },
+    payloadVersion: 1,
+    correlationId: `match:${job.id}:${envelope.contentHashes.input}`,
+    idempotencyKey: `match-job:${context.userId}:${job.id}:${envelope.contentHashes.input}`,
+    maxAttempts: 3,
+  });
   await context.heartbeat();
 }
 
@@ -91,6 +106,25 @@ async function matchJob(context: AutomationJobHandlerContext): Promise<void> {
   if (context.signal.aborted) throw abortError(context.signal);
   await context.heartbeat();
   await executeJobMatch(context.userId, jobId);
+  const master = await withTenant(context.userId, tx => tx.resume.findFirst({
+    where: { userId: context.userId, isMaster: true, sourceFacts: { some: { approved: true } } },
+    select: { id: true },
+    orderBy: [{ updatedAt: 'desc' }, { id: 'asc' }],
+  }));
+  if (master) {
+    // Tailoring is safe to automate only when the candidate has an approved
+    // source of truth. The tailoring service re-checks the facts before its
+    // model call and persists only cited claims.
+    await createAutomationJob({
+      userId: context.userId,
+      type: 'TAILOR_RESUME',
+      payload: { resumeId: master.id, jobId },
+      payloadVersion: 1,
+      correlationId: `tailor:${master.id}:${jobId}`,
+      idempotencyKey: `tailor-resume:${context.userId}:${master.id}:${jobId}`,
+      maxAttempts: 3,
+    });
+  }
   if (context.signal.aborted) throw abortError(context.signal);
   await context.heartbeat();
 }
@@ -102,7 +136,16 @@ async function tailorResume(context: AutomationJobHandlerContext): Promise<void>
   if (context.payloadVersion !== 1) throw new Error('TAILOR_RESUME payloadVersion must be 1');
   if (context.signal.aborted) throw abortError(context.signal);
   await context.heartbeat();
-  await executeResumeTailoring(context.userId, resumeId, jobId);
+  const version = await executeResumeTailoring(context.userId, resumeId, jobId);
+  await createAutomationJob({
+    userId: context.userId,
+    type: 'EVALUATE_ATS',
+    payload: { resumeVersionId: version.id },
+    payloadVersion: 1,
+    correlationId: `ats:${version.id}`,
+    idempotencyKey: `evaluate-ats:${context.userId}:${version.id}`,
+    maxAttempts: 3,
+  });
   if (context.signal.aborted) throw abortError(context.signal);
   await context.heartbeat();
 }
@@ -113,7 +156,22 @@ async function evaluateATS(context: AutomationJobHandlerContext): Promise<void> 
   if (context.payloadVersion !== 1) throw new Error('EVALUATE_ATS payloadVersion must be 1');
   if (context.signal.aborted) throw abortError(context.signal);
   await context.heartbeat();
-  await executeATSEvaluation(context.userId, resumeVersionId);
+  const version = await executeATSEvaluation(context.userId, resumeVersionId);
+  const profiles = await withTenant(context.userId, tx => tx.searchProfile.findMany({
+    where: { userId: context.userId, isActive: true },
+    select: { id: true },
+    orderBy: [{ updatedAt: 'desc' }, { id: 'asc' }],
+  }));
+  if (profiles.length === 1 && version.jobId) {
+    await createApplicationIntent({
+      userId: context.userId,
+      jobId: version.jobId,
+      resumeVersionId: version.id,
+      searchProfileId: profiles[0].id,
+      correlationId: `application:${version.id}:${profiles[0].id}`,
+      idempotencyKey: `application:${context.userId}:${version.id}:${profiles[0].id}`,
+    });
+  }
   if (context.signal.aborted) throw abortError(context.signal);
   await context.heartbeat();
 }
@@ -141,13 +199,15 @@ async function resumeApplicationAfterVerification(context: AutomationJobHandlerC
   await context.heartbeat();
 }
 
-async function executeGreenhouseApplication(context: AutomationJobHandlerContext): Promise<void> {
+type ProviderApplicationExecutor = Pick<GreenhouseApplicationService, 'execute'> | Pick<LeverApplicationService, 'execute'>;
+
+async function executeGreenhouseApplication(context: AutomationJobHandlerContext, executor: Pick<GreenhouseApplicationService, 'execute'> = new GreenhouseApplicationService()): Promise<void> {
   const payload = payloadObject(context);
   const applicationId = requiredText(payload, 'applicationId');
   if (context.payloadVersion !== 1) throw new Error('COMPLETE_GREENHOUSE_APPLICATION payloadVersion must be 1');
   if (context.signal.aborted) throw abortError(context.signal);
   await context.heartbeat();
-  await new GreenhouseApplicationService().execute({
+  await executor.execute({
     userId: context.userId,
     applicationId,
     workerId: context.workerId,
@@ -158,13 +218,13 @@ async function executeGreenhouseApplication(context: AutomationJobHandlerContext
   await context.heartbeat();
 }
 
-async function executeLeverApplication(context: AutomationJobHandlerContext): Promise<void> {
+async function executeLeverApplication(context: AutomationJobHandlerContext, executor: Pick<LeverApplicationService, 'execute'> = new LeverApplicationService()): Promise<void> {
   const payload = payloadObject(context);
   const applicationId = requiredText(payload, 'applicationId');
   if (context.payloadVersion !== 1) throw new Error('COMPLETE_LEVER_APPLICATION payloadVersion must be 1');
   if (context.signal.aborted) throw abortError(context.signal);
   await context.heartbeat();
-  await new LeverApplicationService().execute({
+  await executor.execute({
     userId: context.userId,
     applicationId,
     workerId: context.workerId,
@@ -213,6 +273,24 @@ async function ingestEmailOutcomeJob(context: AutomationJobHandlerContext): Prom
   await context.heartbeat();
 }
 
+async function syncEmailConnectionJob(context: AutomationJobHandlerContext): Promise<void> {
+  const payload = payloadObject(context);
+  const connectionId = requiredText(payload, 'connectionId');
+  const provider = requiredText(payload, 'provider');
+  if (context.payloadVersion !== 1) throw new Error('SYNC_EMAIL_CONNECTION payloadVersion must be 1');
+  if (provider !== 'GMAIL' && provider !== 'MICROSOFT_GRAPH') throw new Error('provider is invalid');
+  if (context.signal.aborted) throw abortError(context.signal);
+  await context.heartbeat();
+  await syncEmailConnection({
+    userId: context.userId,
+    connectionId,
+    connector: createMailboxConnector({ userId: context.userId, provider }),
+    correlationId: context.correlationId,
+  });
+  if (context.signal.aborted) throw abortError(context.signal);
+  await context.heartbeat();
+}
+
 async function verifySubmissionConfirmationJob(context: AutomationJobHandlerContext): Promise<void> {
   const payload = payloadObject(context);
   const applicationId = requiredText(payload, 'applicationId');
@@ -241,7 +319,7 @@ async function verifySubmissionConfirmationJob(context: AutomationJobHandlerCont
   await context.heartbeat();
 }
 
-function discoveryHandler(runDiscovery: typeof executeDiscoveryRun): AutomationJobHandler {
+function discoveryHandler(runDiscovery: typeof executeDiscoveryRun, discoveryExecutor?: DiscoveryExecutor): AutomationJobHandler {
   return async context => {
     const payload = payloadObject(context);
     const runId = requiredText(payload, 'runId');
@@ -249,7 +327,7 @@ function discoveryHandler(runDiscovery: typeof executeDiscoveryRun): AutomationJ
     if (context.signal.aborted) throw abortError(context.signal);
     await context.heartbeat();
     if (context.signal.aborted) throw abortError(context.signal);
-    const result = await runDiscovery(context.userId, runId, undefined, context.signal, {
+    const result = await runDiscovery(context.userId, runId, discoveryExecutor, context.signal, {
       automationJobId: context.automationJobId,
       workerId: context.workerId,
       deliveryGeneration: context.deliveryGeneration,
@@ -271,7 +349,12 @@ function abortError(signal: AbortSignal): Error {
 }
 
 export function createProductionAutomationJobHandlers(
-  dependencies: { executeDiscoveryRun?: typeof executeDiscoveryRun } = {},
+  dependencies: {
+    executeDiscoveryRun?: typeof executeDiscoveryRun;
+    discoveryExecutor?: DiscoveryExecutor;
+    greenhouseApplication?: Pick<GreenhouseApplicationService, 'execute'>;
+    leverApplication?: Pick<LeverApplicationService, 'execute'>;
+  } = {},
 ): AutomationJobHandlerMap {
   return new Map<string, AutomationJobHandler>([
     ['ANALYZE_JOB', analyzeJob],
@@ -279,12 +362,13 @@ export function createProductionAutomationJobHandlers(
     ['TAILOR_RESUME', tailorResume],
     ['EVALUATE_ATS', evaluateATS],
     ['EVALUATE_APPLICATION_QUALITY', evaluateApplicationQuality],
-    ['COMPLETE_GREENHOUSE_APPLICATION', executeGreenhouseApplication],
-    ['COMPLETE_LEVER_APPLICATION', executeLeverApplication],
+    ['COMPLETE_GREENHOUSE_APPLICATION', context => executeGreenhouseApplication(context, dependencies.greenhouseApplication)],
+    ['COMPLETE_LEVER_APPLICATION', context => executeLeverApplication(context, dependencies.leverApplication)],
     ['EXECUTE_AUTHORIZED_SUBMISSION', recordSubmissionHandoff],
     ['EMAIL_OUTCOME', ingestEmailOutcomeJob],
+    ['SYNC_EMAIL_CONNECTION', syncEmailConnectionJob],
     ['VERIFY_SUBMISSION_CONFIRMATION', verifySubmissionConfirmationJob],
     ['RESUME_APPLICATION_AFTER_VERIFICATION', resumeApplicationAfterVerification],
-    ['DISCOVER_JOBS', discoveryHandler(dependencies.executeDiscoveryRun ?? executeDiscoveryRun)],
+    ['DISCOVER_JOBS', discoveryHandler(dependencies.executeDiscoveryRun ?? executeDiscoveryRun, dependencies.discoveryExecutor)],
   ]);
 }

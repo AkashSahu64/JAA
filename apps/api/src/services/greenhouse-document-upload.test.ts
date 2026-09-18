@@ -45,7 +45,7 @@ describe('exact approved resume document upload', () => {
     const storage = { readAuthorized: vi.fn(async () => ({
       buffer: Buffer.from('%PDF'), fileName: document.fileName, mimeType: document.mimeType,
     })) } as Pick<import('./document-storage').DocumentStorage, 'readAuthorized'>;
-    const output = await fillApprovedResumeDocument(port(upload), result(), { ...document, userId: 'authenticated-owner' }, 'version-1', 'authenticated-owner', storage);
+    const output = await fillApprovedResumeDocument(port(upload), result(), { ...document, userId: 'authenticated-owner', approvalStatus: 'APPROVED', approvedAt: new Date(), approvedBy: 'authenticated-owner' }, 'version-1', 'authenticated-owner', storage);
 
     expect(storage.readAuthorized).toHaveBeenCalledWith('authenticated-owner', expect.objectContaining({ userId: 'authenticated-owner' }));
     expect(upload).toHaveBeenCalledWith('resume', expect.objectContaining({ checksumSha256: document.checksumSha256 }));

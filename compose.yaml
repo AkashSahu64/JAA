@@ -1,23 +1,23 @@
 services:
   postgres:
-    image: pgvector/pgvector:0.8.1-pg16
+    image: pgvector/pgvector@sha256:33198da2828a14c30348d2ccb4750833d5ed9a44c88d840a0e523d7417120337
     restart: unless-stopped
     environment:
-      POSTGRES_DB: jobagent
-      POSTGRES_USER: jobagent
-      POSTGRES_PASSWORD: jobagent-local
+      POSTGRES_DB: ${POSTGRES_DB:-jobagent}
+      POSTGRES_USER: ${POSTGRES_USER:-jobagent}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-jobagent-local}
     ports:
       - "5432:5432"
     volumes:
       - jobagent-postgres:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U jobagent -d jobagent"]
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER:-jobagent} -d $${POSTGRES_DB:-jobagent}"]
       interval: 5s
       timeout: 5s
       retries: 10
 
   redis:
-    image: redis:8.2.1-alpine
+    image: redis@sha256:987c376c727652f99625c7d205a1cba3cb2c53b92b0b62aade2bd48ee1593232
     restart: unless-stopped
     command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
     ports:
@@ -31,7 +31,7 @@ services:
       retries: 10
 
   minio:
-    image: quay.io/minio/minio:latest
+    image: quay.io/minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
     restart: unless-stopped
     command: ["server", "/data", "--console-address", ":9001"]
     environment:
@@ -51,7 +51,7 @@ services:
       retries: 10
 
   minio-init:
-    image: quay.io/minio/mc:latest
+    image: quay.io/minio/mc@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727
     depends_on:
       minio:
         condition: service_healthy

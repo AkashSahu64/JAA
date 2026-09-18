@@ -10,6 +10,11 @@ export function refreshTokenHash(token: string): string {
   return createHash('sha256').update(token, 'utf8').digest('hex');
 }
 
+function validSessionIdentity(value: unknown): value is string {
+  return typeof value === 'string' && Boolean(value.trim()) && value.length <= 200
+    && !Array.from(value).some(character => character.charCodeAt(0) < 32 || character.charCodeAt(0) === 127);
+}
+
 export async function rotateRefreshSession(presentedToken: string) {
   let payload: ReturnType<typeof verifyRefreshToken>;
   try { payload = verifyRefreshToken(presentedToken); } catch { throw new RefreshSessionError(); }
@@ -40,7 +45,10 @@ export async function rotateRefreshSession(presentedToken: string) {
     await tx.refreshTokenSession.update({ where: { id: current.id }, data: { revokedAt: now, lastUsedAt: now } });
     await tx.refreshTokenSession.create({ data: {
       userId: payload.userId, tokenHash: refreshTokenHash(refreshToken), familyId: current.familyId,
-      expiresAt: new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000),
+      // Rotation must not extend the lifetime of the original session family.
+      // Otherwise a stolen refresh token can keep a family alive indefinitely
+      // by rotating it just before each rolling seven-day window expires.
+      expiresAt: current.expiresAt,
     } });
     return { token, refreshToken };
   });
@@ -49,6 +57,10 @@ export async function rotateRefreshSession(presentedToken: string) {
 }
 
 export async function revokeRefreshSessionFamily(userId: string, presentedToken: string): Promise<void> {
+  if (!validSessionIdentity(userId) || typeof presentedToken !== 'string' || !presentedToken.trim() || presentedToken.length > 4096
+    || Array.from(presentedToken).some(character => character.charCodeAt(0) < 32 || character.charCodeAt(0) === 127)) {
+    throw new RefreshSessionError();
+  }
   await withTenant(userId, async tx => {
     await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`${userId}:refresh-sessions`}, 0))`;
     const current = await tx.refreshTokenSession.findFirst({ where: { userId, tokenHash: refreshTokenHash(presentedToken) } });

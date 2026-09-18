@@ -6,6 +6,7 @@ describe('application state graph', () => {
   it('allows the controlled forward workflow', () => {
     expect(canTransition(ApplicationStatus.DISCOVERED, ApplicationStatus.QUALIFIED)).toBe(true);
     expect(canTransition(ApplicationStatus.READY_TO_SUBMIT, ApplicationStatus.SUBMISSION_PENDING)).toBe(true);
+    expect(canTransition(ApplicationStatus.SUBMISSION_PENDING, ApplicationStatus.READY_TO_SUBMIT)).toBe(true);
     expect(canTransition(ApplicationStatus.SUBMISSION_PENDING, ApplicationStatus.WAITING_FOR_USER)).toBe(true);
     expect(canTransition(ApplicationStatus.SUBMISSION_PENDING, ApplicationStatus.UNCONFIRMED)).toBe(true);
     expect(canTransition(ApplicationStatus.UNCONFIRMED, ApplicationStatus.CONFIRMED)).toBe(true);

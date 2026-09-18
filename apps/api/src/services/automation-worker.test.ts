@@ -161,7 +161,7 @@ describe('automation worker retry authority', () => {
     await processor(message, { workerId: 'worker-1', signal: new AbortController().signal, heartbeat: vi.fn().mockResolvedValue(undefined) });
 
     const record = JSON.parse(output.mock.calls[0][0] as string) as Record<string, unknown>;
-    expect(record).toMatchObject({ applicationId: 'application-1', provider: 'greenhouse', automationJobId: message.automationJobId });
+    expect(record).toMatchObject({ applicationId: 'application-1', provider: 'greenhouse', automationJobId: message.automationJobId, queue: 'applications' });
     expect(JSON.stringify(record)).not.toContain('secret');
     output.mockRestore();
   });
@@ -225,7 +225,7 @@ describe('automation worker retry authority', () => {
 
     await expect(onFailure(message, new Error('provider failure'), 1_000)).resolves.toBe('RETRY');
     const record = JSON.parse(output.mock.calls[0][0] as string) as Record<string, unknown>;
-    expect(record).toMatchObject({ applicationId: 'application-1', provider: 'lever', automationJobId: message.automationJobId });
+    expect(record).toMatchObject({ applicationId: 'application-1', provider: 'lever', automationJobId: message.automationJobId, queue: 'applications' });
     expect(JSON.stringify(record)).not.toContain('must not log');
     output.mockRestore();
   });

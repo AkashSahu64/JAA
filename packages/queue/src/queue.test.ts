@@ -1,23 +1,45 @@
 import { describe, expect, it } from 'vitest';
-import { bullPriority, deadLetterQueueName, queueForJobType } from './names';
+import { bullPriority, deadLetterQueueName, MAINTENANCE_JOB_TYPES, queueForJobType, routedJobTypes } from './names';
 import { queueJobId, validateEnqueueAutomationJobInput } from './registry';
 import { MAX_RETRY_DELAY_MS, retryDelayMs, retryJitter } from './worker';
 
 describe('automation queue semantics', () => {
+  // These are the job types the worker actually dispatches. Routing is pinned against
+  // real types on purpose: the previous prefix-matching scheme passed a suite built from
+  // invented names (ANALYZE_MATCH, APPLICATION_FILL) while sending real submission jobs
+  // to the maintenance queue.
   it.each([
     ['DISCOVER_JOBS', 'discovery'],
-    ['SEARCH_SOURCE', 'discovery'],
-    ['ANALYZE_MATCH', 'analysis'],
+    ['ANALYZE_JOB', 'analysis'],
+    ['MATCH_JOB', 'analysis'],
     ['TAILOR_RESUME', 'analysis'],
-    ['DOCUMENT_RENDER', 'documents'],
-    ['RESUME_UPLOAD', 'documents'],
-    ['APPLICATION_FILL', 'applications'],
-    ['VERIFY_SUBMISSION', 'applications'],
-    ['NOTIFY_USER', 'notifications'],
+    ['EVALUATE_ATS', 'analysis'],
+    ['EVALUATE_APPLICATION_QUALITY', 'analysis'],
+    ['COMPLETE_GREENHOUSE_APPLICATION', 'applications'],
+    ['COMPLETE_LEVER_APPLICATION', 'applications'],
+    ['EXECUTE_AUTHORIZED_SUBMISSION', 'applications'],
+    ['VERIFY_SUBMISSION_CONFIRMATION', 'applications'],
+    ['RESUME_APPLICATION_AFTER_VERIFICATION', 'applications'],
     ['EMAIL_OUTCOME', 'notifications'],
-    ['LEASE_RECONCILIATION', 'maintenance'],
   ] as const)('routes %s to %s', (type, expected) => {
     expect(queueForJobType(type)).toBe(expected);
+  });
+
+  it('never routes a dispatchable job type to the maintenance queue', () => {
+    for (const type of routedJobTypes()) {
+      expect(queueForJobType(type), type).not.toBe('maintenance');
+    }
+  });
+
+  it('quarantines operational and unknown job types on maintenance', () => {
+    for (const type of MAINTENANCE_JOB_TYPES) {
+      expect(queueForJobType(type), type).toBe('maintenance');
+    }
+    expect(queueForJobType('SOME_FUTURE_JOB')).toBe('maintenance');
+  });
+
+  it('normalizes case and surrounding whitespace before routing', () => {
+    expect(queueForJobType('  execute_authorized_submission  ')).toBe('applications');
   });
 
   it('uses BullMQ-compatible attempt-specific identifiers', () => {

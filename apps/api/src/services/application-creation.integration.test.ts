@@ -39,6 +39,9 @@ describeDatabase.sequential('application creation', () => {
   const primary = fixture(userId, 'primary');
   const competing = fixture(userId, 'competing');
   const other = fixture(otherUserId, 'other');
+  // Fixtures created inside individual tests still need cleanup; jobs are not
+  // user-owned, so deleting the candidate does not remove them.
+  const createdJobIds = new Set<string>([primary.jobId, competing.jobId, other.jobId]);
 
   beforeAll(async () => {
     await prisma.user.createMany({ data: [
@@ -50,6 +53,8 @@ describeDatabase.sequential('application creation', () => {
 
   afterAll(async () => {
     await prisma.user.deleteMany({ where: { id: { in: [userId, otherUserId] } } });
+    // Jobs are not user-owned, so the cascade above does not remove these fixtures.
+    await prisma.job.deleteMany({ where: { id: { in: [...createdJobIds] } } });
     await prisma.$disconnect();
   });
 
@@ -77,6 +82,7 @@ describeDatabase.sequential('application creation', () => {
 
   it('enforces resume-version ownership', async () => {
     const isolated = fixture(userId, 'cross-tenant');
+    createdJobIds.add(isolated.jobId);
     await createFixture(isolated);
     await expect(createApplicationIntent({ ...input(isolated), resumeVersionId: other.versionId }))
       .rejects.toMatchObject({ code: 'NOT_FOUND' } satisfies Partial<ApplicationCreationError>);

@@ -1,0 +1,353 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      NODE_ENV: test
+      DATABASE_INTEGRATION: '0'
+      S3_INTEGRATION: '0'
+      REDIS_INTEGRATION: '0'
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install locked dependencies
+        run: npm ci
+
+      - name: Audit dependencies for high-severity vulnerabilities
+        run: npm audit --audit-level=high
+
+      - name: Generate Prisma client
+        run: npm run db:generate
+
+      - name: Typecheck workspaces
+        run: npm run typecheck
+
+      - name: Audit test coverage integrity
+        run: npm run test:coverage-audit
+
+      - name: Validate Compose contracts
+        run: |
+          docker compose -f compose.yaml config --quiet
+          PRODUCTION_ENV_FILE=.env.production.example docker compose -f compose.production.yaml config --quiet
+
+      - name: Lint source
+        run: npm run lint
+
+      - name: Run configured non-infrastructure tests
+        run: npm test
+
+      - name: Build workspaces
+        run: npm run build
+
+      - name: Check patch hygiene
+        run: git diff --check
+
+  container-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Validate production Dockerfile
+        run: docker build --check -f Dockerfile .
+
+      - name: Build production API/worker image
+        run: docker build --target runtime --tag jobagent-runtime:ci -f Dockerfile .
+
+      - name: Verify image runtime contract
+        run: |
+          test "$(docker inspect --format '{{.Config.User}}' jobagent-runtime:ci)" = "jobagent"
+          docker inspect --format '{{json .Config.Env}}' jobagent-runtime:ci | grep -q 'PLAYWRIGHT_BROWSERS_PATH=/ms-playwright'
+
+      - name: Smoke test dashboard container
+        run: |
+          docker run --detach --name jobagent-web-ci -p 4173:4173 \
+            --env PORT=4173 jobagent-runtime:ci node scripts/serve-web.mjs
+          cleanup() { docker rm -f jobagent-web-ci >/dev/null 2>&1 || true; }
+          trap cleanup EXIT
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent --show-error http://127.0.0.1:4173/ >/dev/null; then
+              break
+            fi
+            if [ "$attempt" -eq 30 ]; then exit 1; fi
+            sleep 1
+          done
+          test "$(curl --fail --silent --output /dev/null --write-out '%{http_code}' http://127.0.0.1:4173/applications)" = "200"
+          curl --fail --silent --head http://127.0.0.1:4173/ | grep -qi '^x-frame-options: DENY'
+          curl --fail --silent --head http://127.0.0.1:4173/ | grep -qi '^x-content-type-options: nosniff'
+          docker exec --env DASHBOARD_BASE_URL=http://127.0.0.1:4173 jobagent-web-ci node scripts/run-dashboard-browser-smoke.mjs
+
+      - name: Start disposable PostgreSQL for local certification
+        run: |
+          docker run --detach --name jobagent-e2e-postgres --publish 5432:5432 \
+            --env POSTGRES_DB=jobagent --env POSTGRES_USER=jobagent --env POSTGRES_PASSWORD=jobagent-ci \
+            pgvector/pgvector:0.8.1-pg16
+          for attempt in $(seq 1 30); do
+            if docker exec jobagent-e2e-postgres pg_isready -U jobagent -d jobagent >/dev/null 2>&1; then
+              break
+            fi
+            if [ "$attempt" -eq 30 ]; then exit 1; fi
+            sleep 1
+          done
+
+      - name: Apply migrations for local certification
+        run: |
+          docker run --rm --network host \
+            --env DATABASE_URL=postgresql://jobagent:jobagent-ci@127.0.0.1:5432/jobagent \
+            --env DATABASE_ADMIN_URL=postgresql://jobagent:jobagent-ci@127.0.0.1:5432/jobagent \
+            jobagent-runtime:ci node_modules/.bin/prisma migrate deploy --schema packages/database/prisma/schema.prisma
+
+      - name: Run local autonomous certification
+        run: |
+          docker run --rm --network host \
+            --env NODE_ENV=test --env DATABASE_INTEGRATION=1 \
+            --env DATABASE_URL=postgresql://jobagent:jobagent-ci@127.0.0.1:5432/jobagent \
+            --env DATABASE_ADMIN_URL=postgresql://jobagent:jobagent-ci@127.0.0.1:5432/jobagent \
+            --env JWT_SECRET=ci-only-fixture-jwt-secret-0123456789 \
+            jobagent-runtime:ci node_modules/.bin/vitest run apps/api/src/services/autonomous-e2e.integration.test.ts
+
+      - name: Tear down local certification database
+        if: always()
+        run: docker rm -f jobagent-e2e-postgres >/dev/null 2>&1 || true
+
+  database-integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      NODE_ENV: test
+      DATABASE_INTEGRATION: '1'
+      DATABASE_URL: postgresql://jobagent:jobagent-ci@127.0.0.1:5432/jobagent
+      DATABASE_ADMIN_URL: postgresql://jobagent:jobagent-ci@127.0.0.1:5432/jobagent
+    services:
+      postgres:
+        image: pgvector/pgvector:0.8.1-pg16
+        env:
+          POSTGRES_DB: jobagent
+          POSTGRES_USER: jobagent
+          POSTGRES_PASSWORD: jobagent-ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U jobagent -d jobagent"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install locked dependencies
+        run: npm ci
+
+      - name: Generate Prisma client
+        run: npm run db:generate
+
+      - name: Apply migrations
+        run: npm run db:migrate:deploy
+
+      - name: Identify PostgreSQL service container
+        run: |
+          container="$(docker ps --filter name=postgres --format '{{.ID}}' | head -n 1)"
+          test -n "$container"
+          echo "POSTGRES_CONTAINER=$container" >> "$GITHUB_ENV"
+
+      - name: Run PostgreSQL integration and isolation gates
+        run: npm run test:database-isolation
+
+  queue-integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      NODE_ENV: test
+      QUEUE_INTEGRATION: '1'
+      DATABASE_URL: postgresql://jobagent:jobagent-ci@127.0.0.1:5432/jobagent
+      DATABASE_ADMIN_URL: postgresql://jobagent:jobagent-ci@127.0.0.1:5432/jobagent
+      REDIS_URL: redis://127.0.0.1:6379
+    services:
+      postgres:
+        image: pgvector/pgvector:0.8.1-pg16
+        env:
+          POSTGRES_DB: jobagent
+          POSTGRES_USER: jobagent
+          POSTGRES_PASSWORD: jobagent-ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U jobagent -d jobagent"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+      redis:
+        image: redis:8.2.1-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install locked dependencies
+        run: npm ci
+
+      - name: Generate Prisma client
+        run: npm run db:generate
+
+      - name: Apply migrations
+        run: npm run db:migrate:deploy
+
+      - name: Run queue and worker integration
+        run: npm run test:queue
+
+  storage-integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      NODE_ENV: test
+      S3_INTEGRATION: '1'
+      S3_DOCUMENT_BUCKET: jobagent-private-documents
+      S3_REGION: us-east-1
+      S3_ENDPOINT: http://127.0.0.1:9000
+      AWS_ACCESS_KEY_ID: jobagent-local
+      AWS_SECRET_ACCESS_KEY: jobagent-local-secret
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install locked dependencies
+        run: npm ci
+
+      - name: Start disposable private MinIO storage
+        run: docker compose -f compose.yaml up -d minio minio-init
+
+      - name: Run S3-compatible storage integration
+        run: npm run test:s3
+
+      - name: Tear down disposable MinIO storage
+        if: always()
+        run: docker compose -f compose.yaml down --remove-orphans
+
+  backup-integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      NODE_ENV: test
+      DATABASE_URL: postgresql://jobagent:jobagent-ci@127.0.0.1:5432/jobagent
+      DATABASE_ADMIN_URL: postgresql://jobagent:jobagent-ci@127.0.0.1:5432/jobagent
+      POSTGRES_CONTAINER: jobagent-ci-postgres-1
+      POSTGRES_PASSWORD: jobagent-ci
+      BACKUP_ENCRYPTION_KEY: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install locked dependencies
+        run: npm ci
+
+      - name: Generate Prisma client
+        run: npm run db:generate
+
+      - name: Start disposable PostgreSQL for backup drill
+        run: docker compose -p jobagent-ci -f compose.yaml up -d postgres
+
+      - name: Apply migrations
+        run: npm run db:migrate:deploy
+
+      - name: Run encrypted backup integrity drill
+        run: npm run test:backup
+
+      - name: Run disposable destructive restore rehearsal
+        run: npm run test:backup:restore
+
+      - name: Tear down disposable PostgreSQL
+        if: always()
+        run: docker compose -p jobagent-ci -f compose.yaml down -v
+
+  resilience-integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      NODE_ENV: test
+      COMPOSE_PROJECT_NAME: job-application-agent
+      DATABASE_URL: postgresql://jobagent:jobagent-local@127.0.0.1:5432/jobagent
+      DATABASE_ADMIN_URL: postgresql://jobagent:jobagent-local@127.0.0.1:5432/jobagent
+      REDIS_URL: redis://127.0.0.1:6379
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install locked dependencies
+        run: npm ci
+
+      - name: Generate Prisma client
+        run: npm run db:generate
+
+      - name: Start disposable PostgreSQL and Redis
+        run: docker compose -f compose.yaml up -d postgres redis
+
+      - name: Apply migrations
+        run: npm run db:migrate:deploy
+
+      - name: Run composed resilience gate
+        run: npm run test:resilience
+
+      - name: Tear down disposable resilience services
+        if: always()
+        run: docker compose -f compose.yaml down -v

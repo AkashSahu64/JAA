@@ -16,7 +16,7 @@ const remove = spawnSync(docker, ['rm', '-f', containerName], { stdio: 'ignore' 
 if (remove.error && remove.error.code !== 'ENOENT') throw remove.error;
 const start = spawnSync(docker, [
   'run', '-d', '--name', containerName, '-p', `${redisPort}:6379`,
-  'redis:8.2.1-alpine', 'redis-server', '--appendonly', 'yes', '--appendfsync', 'everysec',
+  'redis@sha256:987c376c727652f99625c7d205a1cba3cb2c53b92b0b62aade2bd48ee1593232', 'redis-server', '--appendonly', 'yes', '--appendfsync', 'everysec',
 ], { stdio: 'inherit' });
 if (start.error) throw start.error;
 if (start.status !== 0) process.exit(start.status ?? 1);

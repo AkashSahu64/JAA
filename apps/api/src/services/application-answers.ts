@@ -3,7 +3,9 @@ import { withTenant } from '@jobagent/database';
 
 export type ApplicationAnswerDecision = 'APPROVE' | 'REJECT';
 export type ApplicationAnswerSource = 'USER_PROFILE' | 'USER_INPUT' | 'COVER_LETTER' | 'AI_SUGGESTION';
+export type ApplicationAnswerValue = string | boolean | readonly string[] | { profileKey: string } | { source: 'coverLetter' };
 const applicationAnswerSources = new Set<ApplicationAnswerSource>(['USER_PROFILE', 'USER_INPUT', 'COVER_LETTER', 'AI_SUGGESTION']);
+const applicationProfileKeys = new Set(['firstName', 'lastName', 'email', 'phone', 'location', 'linkedinUrl', 'websiteUrl']);
 const MAX_ANSWER_TEXT_LENGTH = 20_000;
 const MAX_ANSWER_OPTIONS = 100;
 const MAX_ANSWER_OPTION_LENGTH = 500;
@@ -23,11 +25,22 @@ export class ApplicationAnswerError extends Error {
   }
 }
 
-function isSupportedValue(value: unknown): value is string | boolean | readonly string[] {
+function isSupportedValue(value: unknown, source: ApplicationAnswerSource): value is ApplicationAnswerValue {
+  if (source === 'USER_PROFILE') return Boolean(value && typeof value === 'object' && !Array.isArray(value)
+    && Object.keys(value).length === 1 && typeof (value as { profileKey?: unknown }).profileKey === 'string'
+    && applicationProfileKeys.has((value as { profileKey: string }).profileKey));
+  if (source === 'COVER_LETTER') return Boolean(value && typeof value === 'object' && !Array.isArray(value)
+    && Object.keys(value).length === 1 && (value as { source?: unknown }).source === 'coverLetter');
   return (typeof value === 'string' && value.length <= MAX_ANSWER_TEXT_LENGTH)
     || typeof value === 'boolean'
     || (Array.isArray(value) && value.length <= MAX_ANSWER_OPTIONS
       && value.every(item => typeof item === 'string' && item.length <= MAX_ANSWER_OPTION_LENGTH));
+}
+
+function isSourceConsistent(value: ApplicationAnswerValue, source: ApplicationAnswerSource, provenance: Record<string, unknown> | undefined): boolean {
+  if (!provenance || provenance.source !== source) return false;
+  if (source === 'USER_PROFILE') return provenance.profileKey === (value as { profileKey: string }).profileKey;
+  return source !== 'COVER_LETTER' || (value as { source: 'coverLetter' }).source === 'coverLetter';
 }
 
 function isValidExpectedVersion(value: number | undefined): boolean {
@@ -49,13 +62,14 @@ export async function saveApplicationAnswerDraft(input: {
   userId: string;
   applicationId: string;
   questionId: string;
-  value: string | boolean | readonly string[];
+  value: ApplicationAnswerValue;
   source: ApplicationAnswerSource;
   provenance?: Record<string, unknown>;
   expectedVersion?: number;
 }): Promise<ApplicationAnswer> {
-  if (!isSafeIdentifier(input.userId) || !isSafeIdentifier(input.applicationId) || !isSafeIdentifier(input.questionId) || !isSupportedValue(input.value)
-    || !applicationAnswerSources.has(input.source) || !isValidApplicationAnswerProvenance(input.provenance) || !isValidExpectedVersion(input.expectedVersion)) {
+  if (!isSafeIdentifier(input.userId) || !isSafeIdentifier(input.applicationId) || !isSafeIdentifier(input.questionId) || !isSupportedValue(input.value, input.source)
+    || !applicationAnswerSources.has(input.source) || !isValidApplicationAnswerProvenance(input.provenance)
+    || !isSourceConsistent(input.value, input.source, input.provenance) || !isValidExpectedVersion(input.expectedVersion)) {
     throw new ApplicationAnswerError('INVALID', 'Application answer identifiers and a supported answer value are required');
   }
   return withTenant(input.userId, async tx => {
@@ -135,6 +149,10 @@ export async function decideApplicationAnswer(input: {
         },
       });
       return null;
+    }
+    if (!isSourceConsistent(answer.value as ApplicationAnswerValue, answer.source as ApplicationAnswerSource,
+      answer.provenance && typeof answer.provenance === 'object' && !Array.isArray(answer.provenance) ? answer.provenance as Record<string, unknown> : undefined)) {
+      throw new ApplicationAnswerError('INVALID', 'Answer provenance does not match its trusted source reference');
     }
     const approved = await tx.applicationAnswer.update({
       where: { id: answer.id },

@@ -79,6 +79,7 @@ export function validateSubmissionVerificationEvidence(evidence: SubmissionVerif
 /** Normalize only bounded confirmation signals; never persist the page text itself. */
 export function parseProviderConfirmation(input: {
   applicationId: string;
+  attemptId?: string;
   provider: SubmissionVerificationEvidence['provider'];
   pageText: string;
   observedAt: Date;
@@ -96,6 +97,7 @@ export function parseProviderConfirmation(input: {
   const evidenceHash = createHash('sha256').update(input.pageText, 'utf8').digest('hex');
   const evidence: SubmissionVerificationEvidence = {
     applicationId: input.applicationId,
+    ...(input.attemptId === undefined ? {} : { attemptId: input.attemptId }),
     provider: input.provider,
     confirmationId: identifier,
     evidenceHash,
@@ -110,6 +112,7 @@ export function parseProviderConfirmation(input: {
 /** Normalize a provider response at the trusted adapter boundary without persisting arbitrary response data. */
 export function parseProviderResponse(input: {
   applicationId: string;
+  attemptId?: string;
   provider: SubmissionVerificationEvidence['provider'];
   response: { confirmationId?: unknown; applicationId?: unknown; status?: unknown };
   observedAt: Date;
@@ -126,6 +129,7 @@ export function parseProviderResponse(input: {
   const normalized = JSON.stringify({ provider: input.provider, status, confirmationId: confirmationId.trim() });
   const evidence: SubmissionVerificationEvidence = {
     applicationId: input.applicationId,
+    ...(input.attemptId === undefined ? {} : { attemptId: input.attemptId }),
     provider: input.provider,
     confirmationId: confirmationId.trim(),
     evidenceHash: createHash('sha256').update(normalized, 'utf8').digest('hex'),
@@ -137,9 +141,38 @@ export function parseProviderResponse(input: {
   return evidence;
 }
 
+/** Normalize an application identifier returned by a trusted provider boundary. */
+export function parseProviderApplicationId(input: {
+  applicationId: string;
+  attemptId?: string;
+  provider: SubmissionVerificationEvidence['provider'];
+  providerApplicationId: string;
+  observedAt: Date;
+}): SubmissionVerificationEvidence {
+  if (!input || typeof input.providerApplicationId !== 'string'
+    || !/^[a-z0-9][a-z0-9_-]{3,199}$/i.test(input.providerApplicationId.trim())) {
+    throw new SubmissionVerificationError('INVALID', 'Provider application ID evidence is missing or unbounded');
+  }
+  const confirmationId = input.providerApplicationId.trim();
+  const normalized = JSON.stringify({ provider: input.provider, confirmationId });
+  const evidence: SubmissionVerificationEvidence = {
+    applicationId: input.applicationId,
+    ...(input.attemptId === undefined ? {} : { attemptId: input.attemptId }),
+    provider: input.provider,
+    confirmationId,
+    evidenceHash: createHash('sha256').update(normalized, 'utf8').digest('hex'),
+    parserVersion: 'provider-application-id-parser/1.0.0',
+    observedAt: input.observedAt,
+    source: 'APPLICATION_ID',
+  };
+  validateSubmissionVerificationEvidence(evidence);
+  return evidence;
+}
+
 export async function queueProviderResponseVerification(input: {
   userId: string;
   applicationId: string;
+  attemptId?: string;
   correlationId: string;
   provider: SubmissionVerificationEvidence['provider'];
   response: { confirmationId?: unknown; applicationId?: unknown; status?: unknown };
@@ -159,10 +192,35 @@ export async function queueProviderResponseVerification(input: {
   return { evidence, automationJob };
 }
 
+/** Enqueue normalized provider application-ID evidence without retaining raw provider payloads. */
+export async function queueProviderApplicationIdVerification(input: {
+  userId: string;
+  applicationId: string;
+  attemptId?: string;
+  correlationId: string;
+  provider: SubmissionVerificationEvidence['provider'];
+  providerApplicationId: string;
+  observedAt: Date;
+}) {
+  const evidence = parseProviderApplicationId(input);
+  const automationJob = await createAutomationJob({
+    userId: input.userId,
+    applicationId: input.applicationId,
+    type: 'VERIFY_SUBMISSION_CONFIRMATION',
+    payload: { ...evidence, observedAt: evidence.observedAt.toISOString() } as unknown as Prisma.InputJsonValue,
+    payloadVersion: 1,
+    maxAttempts: 1,
+    correlationId: input.correlationId,
+    idempotencyKey: `verify-submission:${input.applicationId}:${evidence.evidenceHash}`,
+  });
+  return { evidence, automationJob };
+}
+
 /** Parse trusted browser output and enqueue only normalized evidence metadata. */
 export async function queueProviderConfirmationVerification(input: {
   userId: string;
   applicationId: string;
+  attemptId?: string;
   correlationId: string;
   provider: SubmissionVerificationEvidence['provider'];
   pageText: string;
@@ -170,6 +228,7 @@ export async function queueProviderConfirmationVerification(input: {
 }) {
   const evidence = parseProviderConfirmation({
     applicationId: input.applicationId,
+    attemptId: input.attemptId,
     provider: input.provider,
     pageText: input.pageText,
     observedAt: input.observedAt,
@@ -191,6 +250,7 @@ export async function queueProviderConfirmationVerification(input: {
 export async function verifyProviderConfirmation(input: {
   userId: string;
   applicationId: string;
+  attemptId?: string;
   correlationId: string;
   provider: SubmissionVerificationEvidence['provider'];
   pageText: string;
@@ -198,10 +258,31 @@ export async function verifyProviderConfirmation(input: {
 }) {
   const evidence = parseProviderConfirmation({
     applicationId: input.applicationId,
+    attemptId: input.attemptId,
     provider: input.provider,
     pageText: input.pageText,
     observedAt: input.observedAt,
   });
+  return verifySubmission({
+    userId: input.userId,
+    applicationId: input.applicationId,
+    correlationId: input.correlationId,
+    trustedBoundary: true,
+    evidence,
+  });
+}
+
+/** Verify a provider application ID captured by a trusted adapter/verifier boundary. */
+export async function verifyProviderApplicationId(input: {
+  userId: string;
+  applicationId: string;
+  attemptId?: string;
+  correlationId: string;
+  provider: SubmissionVerificationEvidence['provider'];
+  providerApplicationId: string;
+  observedAt: Date;
+}) {
+  const evidence = parseProviderApplicationId(input);
   return verifySubmission({
     userId: input.userId,
     applicationId: input.applicationId,
@@ -237,7 +318,7 @@ export async function verifySubmission(input: {
       },
     });
     if (!application) throw new SubmissionVerificationError('NOT_FOUND', 'Application not found');
-    if (application.job.source !== input.evidence.provider) {
+    if (application.job.source.trim().toUpperCase() !== input.evidence.provider) {
       throw new SubmissionVerificationError('CONFLICT', 'Verification evidence provider does not match the application provider');
     }
     // Replay is checked before the attempt gate because successful verification closes

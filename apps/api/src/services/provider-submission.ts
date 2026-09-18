@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { Prisma } from '@prisma/client';
 import { withTenant } from '@jobagent/database';
-import { greenhouseApplicationHost, GreenhouseApplicationAdapter, leverApplicationHost, LeverApplicationAdapter, type ApprovedApplicationAnswer, type GreenhouseFormPort, type LeverFormPort } from '@jobagent/job-engine';
+import { advanceStepIfComplete, greenhouseApplicationHost, GreenhouseApplicationAdapter, leverApplicationHost, LeverApplicationAdapter, type ApprovedApplicationAnswer, type GreenhouseFormPort, type LeverFormPort } from '@jobagent/job-engine';
 import type { Page } from 'playwright';
 import { BrowserSessionManager, type StartBrowserSessionInput } from './browser-session-manager';
 import { DocumentStorage, DocumentStorageError, validateStoredDocumentMetadata } from './document-storage';
@@ -46,6 +46,7 @@ type PreparedSubmission = {
   allowedHost: string;
   profile: { firstName?: string; lastName?: string; email?: string; phone?: string; location?: string; linkedinUrl?: string; websiteUrl?: string };
   approvedAnswers: ApprovedApplicationAnswer[];
+  coverLetter?: string;
   document: { bucket: string; objectKey: string; versionId: string | null; fileName: string; mimeType: string; checksumSha256: string; byteSize: bigint };
   coverLetterDocument?: { userId: string; resumeVersionId: string | null; bucket: string; objectKey: string; versionId: string | null; fileName: string; mimeType: string; checksumSha256: string; byteSize: bigint; scanStatus: string; deletedAt: Date | null; expiresAt: Date | null };
 };
@@ -70,13 +71,17 @@ function approvedAnswersFor(
     const source = answer.source;
     if (provenance.source !== source) continue;
     if (source !== 'USER_PROFILE' && source !== 'USER_INPUT' && source !== 'COVER_LETTER' && source !== 'AI_SUGGESTION') continue;
+    // Profile-derived values are supplied from the authenticated profile below;
+    // a scalar USER_PROFILE answer is never a valid custom-answer payload.
+    if (source === 'USER_PROFILE') continue;
     answers.push({ answerId: answer.id, questionIdentity: question.externalKey, ownerId, value: resolvedValue, source, approved: true, approvedAt: answer.approvedAt, approvedBy: answer.approvedBy, provenance, version: answer.version });
   }
   return answers;
 }
 
 function providerFor(source: string): Provider {
-  if (source === 'GREENHOUSE' || source === 'LEVER') return source;
+  const normalized = source.trim().toUpperCase();
+  if (normalized === 'GREENHOUSE' || normalized === 'LEVER') return normalized;
   throw new ProviderSubmissionError('PRECONDITION_FAILED', 'The application source has no certified submission adapter');
 }
 
@@ -105,9 +110,13 @@ function evidenceMatches(
   const document = application.resumeVersion.objectMetadata;
   if (!recorded || typeof recorded !== 'object' || Array.isArray(recorded) || !document) return false;
   const reference = recorded as Record<string, unknown>;
-  const sameApproval = (candidate: Record<string, unknown>, current: { approvalStatus?: string; approvedAt?: Date | null; approvedBy?: string | null }) => (candidate.approvalStatus ?? null) === (current.approvalStatus ?? null)
-    && (candidate.approvedAt ?? null) === (current.approvedAt?.toISOString() ?? null)
-    && (candidate.approvedBy ?? null) === (current.approvedBy ?? null);
+  const sameApproval = (candidate: Record<string, unknown>, current: { approvalStatus?: string; approvedAt?: Date | null; approvedBy?: string | null }) => {
+    const approvedAt = current.approvedAt instanceof Date && Number.isFinite(current.approvedAt.getTime())
+      ? current.approvedAt.toISOString() : null;
+    return (candidate.approvalStatus ?? null) === (current.approvalStatus ?? null)
+      && (candidate.approvedAt ?? null) === approvedAt
+      && (candidate.approvedBy ?? null) === (current.approvedBy ?? null);
+  };
   const sameDocument = (candidate: Record<string, unknown>, current: NonNullable<typeof document>) => candidate.id === current.id
     && candidate.kind === current.kind && candidate.resumeVersionId === current.resumeVersionId && candidate.bucket === current.bucket && candidate.objectKey === current.objectKey
     && (candidate.versionId ?? null) === (current.versionId ?? null) && candidate.fileName === current.fileName
@@ -165,7 +174,7 @@ export class ProviderSubmissionService {
       const approvedResumeArtifact = document && ['RESUME_SOURCE', 'RESUME_APPROVED', 'RESUME_TAILORED'].includes(document.kind);
       if (!document || !exactDocument || !approvedResumeArtifact || document.userId !== input.userId
         || !document.objectKey.startsWith('private/') || !/^[a-f0-9]{64}$/i.test(document.checksumSha256)
-        || document.approvalStatus !== 'APPROVED' || !document.approvedAt || document.approvedBy !== input.userId
+        || document.approvalStatus !== 'APPROVED' || !(document.approvedAt instanceof Date) || !Number.isFinite(document.approvedAt.getTime()) || document.approvedBy !== input.userId
         || !document.encryptionKeyRef?.trim() || document.scanStatus !== 'CLEAN' || document.deletedAt || (document.expiresAt && document.expiresAt <= new Date())) {
         throw new ProviderSubmissionError('PRECONDITION_FAILED', 'The authorized resume document is no longer available');
       }
@@ -180,7 +189,7 @@ export class ProviderSubmissionService {
       const coverLetterDocument = coverLetterDocuments[0]?.objectMetadata;
       if (coverLetterDocument) {
         if (coverLetterDocument.userId !== input.userId || coverLetterDocument.resumeVersionId !== authorization.application.resumeVersionId || coverLetterDocument.kind !== 'COVER_LETTER'
-          || coverLetterDocument.approvalStatus !== 'APPROVED' || !coverLetterDocument.approvedAt || coverLetterDocument.approvedBy !== input.userId
+          || coverLetterDocument.approvalStatus !== 'APPROVED' || !(coverLetterDocument.approvedAt instanceof Date) || !Number.isFinite(coverLetterDocument.approvedAt.getTime()) || coverLetterDocument.approvedBy !== input.userId
           || !coverLetterDocument.encryptionKeyRef?.trim() || coverLetterDocument.scanStatus !== 'CLEAN' || coverLetterDocument.deletedAt || (coverLetterDocument.expiresAt && coverLetterDocument.expiresAt <= new Date())) {
           throw new ProviderSubmissionError('PRECONDITION_FAILED', 'The authorized cover-letter document is unavailable');
         }
@@ -194,7 +203,7 @@ export class ProviderSubmissionService {
       const provider = providerFor(authorization.application.job.source);
       const targetUrl = authorization.application.job.applicationUrl;
       const coverLetter = authorization.application.coverLetter?.userId === input.userId ? authorization.application.coverLetter.content : undefined;
-      return { provider, targetUrl, allowedHost: providerHost(targetUrl, provider), profile: profileFor(authorization.user.profile), approvedAnswers: approvedAnswersFor(authorization.application.questionsNormalized ?? [], input.userId, coverLetter), document, coverLetterDocument: coverLetterDocument ?? undefined } satisfies PreparedSubmission;
+      return { provider, targetUrl, allowedHost: providerHost(targetUrl, provider), profile: profileFor(authorization.user.profile), approvedAnswers: approvedAnswersFor(authorization.application.questionsNormalized ?? [], input.userId, coverLetter), coverLetter: coverLetter?.trim() || undefined, document, coverLetterDocument: coverLetterDocument ?? undefined } satisfies PreparedSubmission;
     });
 
     const file = await this.documentStorage.readAuthorized(input.userId, prepared.document);
@@ -238,7 +247,8 @@ export class ProviderSubmissionService {
           if (fill.validationErrors.length
             || fill.requiredBlockingFieldIds.some(id => {
               const field = fill.fields.find(candidate => candidate.id === id);
-              return !this.isResumeField(field) && !this.isCoverLetterField(field);
+              return !this.isResumeField(field) && !this.isCoverLetterField(field)
+                && !(this.isCoverLetterTextField(field) && Boolean(prepared.coverLetter));
             })) {
             throw new ProviderSubmissionError('PRECONDITION_FAILED', 'The application contains fields that require a human review before submission');
           }
@@ -246,6 +256,9 @@ export class ProviderSubmissionService {
           if (fileFields.length > 1 || (fileFields.length === 1 && uploadedResume)) {
             throw new ProviderSubmissionError('PRECONDITION_FAILED', 'The application contains an ambiguous or repeated resume upload control');
           }
+          // Field ids whose blocker this submission resolved by supplying the exact
+          // authorized document; the adapter judged completion before these ran.
+          const resolvedFieldIds: string[] = [];
           if (fileFields.length === 1) {
             if (!port.uploadDocument) throw new ProviderSubmissionError('PRECONDITION_FAILED', 'The provider does not expose a certified document-upload capability');
             await port.uploadDocument(fileFields[0].id, {
@@ -255,6 +268,7 @@ export class ProviderSubmissionService {
               bytes: file.buffer,
             });
             uploadedResume = true;
+            resolvedFieldIds.push(fileFields[0].id);
           }
           const coverLetterFields = fill.fields.filter(field => this.isCoverLetterField(field));
           if (coverLetterFields.length > 1 || (coverLetterFields.length === 1 && uploadedCoverLetter)) {
@@ -271,9 +285,27 @@ export class ProviderSubmissionService {
               bytes: coverLetterFile.buffer,
             });
             uploadedCoverLetter = true;
+            resolvedFieldIds.push(coverLetterFields[0].id);
           }
-          if (!fill.hasNextStep) break;
-          if (!fill.advanced) throw new ProviderSubmissionError('PRECONDITION_FAILED', 'The provider did not safely advance the application step');
+          const coverLetterTextFields = fill.fields.filter(field => this.isCoverLetterTextField(field));
+          if (coverLetterTextFields.length > 1) {
+            throw new ProviderSubmissionError('PRECONDITION_FAILED', 'The application contains an ambiguous or repeated cover-letter text control');
+          }
+          if (coverLetterTextFields.length === 1 && prepared.coverLetter) {
+            await port.fill(coverLetterTextFields[0].id, prepared.coverLetter);
+            resolvedFieldIds.push(coverLetterTextFields[0].id);
+          }
+          // Re-evaluate completion now that the authorized documents are attached. Reading
+          // the adapter's earlier verdict instead would fail every multi-step provider form
+          // whose step carries a required resume upload: the upload succeeds here, and the
+          // step would still be reported as unable to advance. Only the blocker this
+          // submission actually resolved is removed; everything else still stops the loop.
+          const stepResult = await advanceStepIfComplete(port, {
+            ...fill,
+            requiredBlockingFieldIds: fill.requiredBlockingFieldIds.filter(id => !resolvedFieldIds.includes(id)),
+          });
+          if (!stepResult.hasNextStep) break;
+          if (!stepResult.advanced) throw new ProviderSubmissionError('PRECONDITION_FAILED', 'The provider did not safely advance the application step');
           if (step === maxSubmissionSteps - 1) throw new ProviderSubmissionError('PRECONDITION_FAILED', 'The application exceeded the safe step limit');
         }
         if (!finalFill || !uploadedResume) throw new ProviderSubmissionError('PRECONDITION_FAILED', 'Exactly one verified resume upload field is required for automatic submission');
@@ -316,5 +348,9 @@ export class ProviderSubmissionService {
 
   private isCoverLetterField(field: { kind: string; name: string; label: string; accessibleName?: string } | undefined): boolean {
     return field?.kind === 'FILE' && /cover[\s_-]*letter/i.test(`${field.name} ${field.label} ${field.accessibleName ?? ''}`);
+  }
+
+  private isCoverLetterTextField(field: { kind: string; name: string; label: string; accessibleName?: string } | undefined): boolean {
+    return Boolean(field && (field.kind === 'TEXT' || field.kind === 'TEXTAREA') && /cover[\s_-]*letter/i.test(`${field.name} ${field.label} ${field.accessibleName ?? ''}`));
   }
 }

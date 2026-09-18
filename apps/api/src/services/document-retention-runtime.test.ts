@@ -15,7 +15,8 @@ describe('DocumentRetentionRuntime', () => {
 
   it('validates bounded interval and shutdown configuration', () => {
     expect(() => new DocumentRetentionRuntime({ intervalMs: 999 })).toThrow('Document retention interval must be at least one second');
-    expect(() => new DocumentRetentionRuntime({ shutdownTimeoutMs: 999 })).toThrow('Document retention shutdown timeout must be at least one second');
+    expect(() => new DocumentRetentionRuntime({ shutdownTimeoutMs: 999 })).toThrow('Document retention shutdown timeout must be between one second and two minutes');
+    expect(() => new DocumentRetentionRuntime({ shutdownTimeoutMs: 120_001 })).toThrow('between one second and two minutes');
   });
 
   it('coalesces overlapping runs and schedules future retention work', async () => {

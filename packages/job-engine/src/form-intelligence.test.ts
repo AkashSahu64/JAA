@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
+  advanceStepIfComplete,
   approvedAnswerResolver,
   assessApplicationForm,
   assessApplicationFormField,
@@ -7,7 +8,11 @@ import {
   defaultFieldExtractor,
   defaultFormDetector,
   stableQuestionIdentity,
+  stepIsComplete,
+  type ApplicationFormDisposition,
   type ApplicationFormField,
+  type ApplicationFormFillResult,
+  type ApplicationFormPort,
 } from './form-intelligence';
 
 describe('application form intelligence', () => {
@@ -45,6 +50,18 @@ describe('application form intelligence', () => {
     })).toEqual(expect.objectContaining({
       disposition: 'PROFILE_DERIVED', profileKey: 'email',
     }));
+  });
+
+  it('fails closed for malformed profile values at the shared resolver boundary', () => {
+    const field: ApplicationFormField = { id: 'email', identity: 'UNKNOWN:contact:TEXT:email:email:one', name: 'email', label: 'Email', kind: 'TEXT', required: true };
+    const assessment = assessApplicationFormField(field);
+    expect(approvedAnswerResolver.resolve({ field, assessment, profile: { email: 'x'.repeat(20_001) } })).toBeUndefined();
+    expect(approvedAnswerResolver.resolve({ field, assessment, profile: { email: 'ada\u0000@example.com' } })).toBeUndefined();
+  });
+
+  it('requires an owner boundary before resolving a profile-derived answer', () => {
+    const field: ApplicationFormField = { id: 'email', identity: 'UNKNOWN:contact:TEXT:email:email:one', name: 'email', label: 'Email', kind: 'TEXT', required: true };
+    expect(approvedAnswerResolver.resolve({ field, assessment: assessApplicationFormField(field), profile: { email: 'candidate@example.test' } })).toBeUndefined();
   });
 
   it.each([
@@ -122,6 +139,26 @@ describe('application form intelligence', () => {
       .not.toBe(stableQuestionIdentity('GREENHOUSE', first, 'work-history'));
   });
 
+  it('keeps semantic question identity stable when a provider rewords a stable field label', () => {
+    const first: ApplicationFormField = {
+      id: 'field-a', name: 'email', label: 'Email address', kind: 'TEXT', required: true,
+    };
+    expect(stableQuestionIdentity('GREENHOUSE', first, 'contact'))
+      .toBe(stableQuestionIdentity('GREENHOUSE', { ...first, label: 'Work email' }, 'contact'));
+  });
+
+  it('assigns deterministic occurrences to repeated semantic fields despite different labels', () => {
+    const fields = defaultFieldExtractor.extract({
+      provider: 'GREENHOUSE', step: 1, stepIdentity: 'contact', hasNextStep: false,
+      fields: [
+        { id: 'home', name: 'phone', label: 'Home phone', kind: 'TEXT', required: false },
+        { id: 'work', name: 'phone', label: 'Work phone', kind: 'TEXT', required: false },
+      ],
+    });
+    expect(new Set(fields.map(field => field.questionIdentity)).size).toBe(2);
+    expect(fields.map(field => field.occurrenceKey).sort()).toEqual(['duplicate-1', 'duplicate-2']);
+  });
+
   it('uses an ARIA accessible name when a visible label is unavailable', () => {
     const field: ApplicationFormField = {
       id: 'aria-email', name: 'opaque_field', label: '', accessibleName: 'Email address', kind: 'TEXT', required: true,
@@ -145,6 +182,13 @@ describe('application form intelligence', () => {
     const rerendered = { ...first, options: ['Engineering', 'Design', 'Research'] };
     expect(stableQuestionIdentity('GREENHOUSE', first, 'application'))
       .toBe(stableQuestionIdentity('GREENHOUSE', rerendered, 'application'));
+  });
+
+  it('retains international semantic labels so distinct questions do not collide', () => {
+    const french = { name: 'question', label: 'École fréquentée', kind: 'TEXT' as const };
+    const japanese = { name: 'question', label: '学校名', kind: 'TEXT' as const };
+    expect(stableQuestionIdentity('UNKNOWN', french, 'application'))
+      .not.toBe(stableQuestionIdentity('UNKNOWN', japanese, 'application'));
   });
 
   it('keeps opaque-field identity stable when a provider renames the DOM control', () => {
@@ -196,6 +240,17 @@ describe('application form intelligence', () => {
     expect(approvedAnswerResolver.resolve({ field, assessment, ownerId: 'user-1', approvedAnswers: [{
       answerId: 'oversized-value', questionIdentity: field.identity!, ownerId: 'user-1', value: 'x'.repeat(20_001),
       source: 'USER_INPUT', approved: true, approvedAt: new Date(), approvedBy: 'user-1', version: 8,
+      provenance: { source: 'USER_INPUT' },
+    }] })).toBeUndefined();
+  });
+
+  it('does not fall back to an arbitrary approved answer when a profile field is missing', () => {
+    const field: ApplicationFormField = { id: 'email', name: 'email', label: 'Email', kind: 'TEXT', required: true };
+    const assessment = assessApplicationFormField(field);
+    expect(assessment.disposition).toBe('PROFILE_DERIVED');
+    expect(approvedAnswerResolver.resolve({ field, assessment, ownerId: 'user-1', profile: {}, approvedAnswers: [{
+      answerId: 'wrong-source', questionIdentity: assessment.questionIdentity!, ownerId: 'user-1', value: 'attacker@example.test',
+      source: 'USER_INPUT', approved: true, approvedAt: new Date(), approvedBy: 'user-1', version: 1,
       provenance: { source: 'USER_INPUT' },
     }] })).toBeUndefined();
   });
@@ -359,6 +414,16 @@ describe('application form intelligence', () => {
     expect(fields.find(field => field.id === 'name')?.validationErrors).toEqual([]);
   });
 
+  it('sanitizes provider validation messages before persistence consumers see them', () => {
+    const fields = defaultFieldExtractor.extract({
+      provider: 'UNKNOWN', step: 1, hasNextStep: false,
+      fields: [{ id: 'email', name: 'email', label: 'Email', kind: 'TEXT', required: true }],
+      validationErrors: [{ fieldId: 'email', message: 'Invalid\nemail\r\nInjected: yes' }],
+    });
+    expect(fields[0]?.validationErrors).toEqual(['Invalid email  Injected: yes']);
+    expect(fields[0]?.validationErrors?.[0]).not.toMatch(/[\r\n]/);
+  });
+
   it('gives duplicate semantic controls distinct identities without using DOM ids', () => {
     const adapter = new ApplicationFormAdapter();
     const first = adapter.inspect({ provider: 'LEVER', step: 1, stepIdentity: 'contact', hasNextStep: false, fields: [
@@ -517,6 +582,18 @@ describe('application form intelligence', () => {
     expect(identity).not.toContain('field-id');
   });
 
+  it('bounds and sanitizes provider field metadata before shared evidence consumers see it', () => {
+    const field = defaultFieldExtractor.extract({ provider: 'UNKNOWN', step: 0, hasNextStep: false, fields: [{
+      id: 'field', name: `name\n${'x'.repeat(3_000)}`, label: `label\r${'x'.repeat(3_000)}`, kind: 'SELECT', required: false,
+      options: [`one\n${'x'.repeat(600)}`, 'two'],
+    }] as never })[0]!;
+    expect(field.name.length).toBeLessThanOrEqual(2_000);
+    expect(field.label.length).toBeLessThanOrEqual(2_000);
+    expect(field.name).not.toContain('\n');
+    expect(field.label).not.toContain('\r');
+    expect(field.options?.[0].length).toBeLessThanOrEqual(500);
+  });
+
   it('drops malformed webpage control ids before they reach a provider port', () => {
     const fields = defaultFieldExtractor.extract({
       provider: 'UNKNOWN', step: 0, hasNextStep: false,
@@ -527,5 +604,168 @@ describe('application form intelligence', () => {
       ],
     });
     expect(fields.map(field => field.id)).toEqual(['safe-control']);
+  });
+});
+
+describe('application form policy classification', () => {
+  // Every disposition the shared policy contract can produce, pinned by an exact
+  // input. If the ladder is reordered or a pattern is loosened, the class it was
+  // protecting changes here rather than silently downstream.
+  const cases: ReadonlyArray<readonly [ApplicationFormDisposition, ApplicationFormField]> = [
+    ['SAFE', { id: 'newsletter', name: 'newsletter', label: 'Newsletter', kind: 'CHECKBOX', required: false }],
+    ['PROFILE_DERIVED', { id: 'email', name: 'email', label: 'Email address', kind: 'TEXT', required: true }],
+    ['AMBIGUOUS', { id: 'custom', name: 'custom', label: 'Question', kind: 'TEXT', required: true }],
+    ['SENSITIVE', { id: 'sex_at_birth', name: 'sex_at_birth', label: 'Sex at birth', kind: 'SELECT', required: false, options: ['Female', 'Male'] }],
+    ['HIGH_RISK', { id: 'work_auth', name: 'work_authorization', label: 'Work authorization', kind: 'SELECT', required: true, options: ['Yes', 'No'] }],
+    ['UNSUPPORTED', { id: 'resume', name: 'resume', label: 'Resume', kind: 'FILE', required: true }],
+    ['HUMAN_VERIFICATION_REQUIRED', { id: 'g-recaptcha-response', name: 'g-recaptcha-response', label: 'Security check', kind: 'TEXT', required: true }],
+  ];
+
+  it.each(cases)('classifies a %s control as exactly that disposition', (disposition, field) => {
+    expect(assessApplicationFormField(field).disposition).toBe(disposition);
+  });
+
+  it('produces the same classification for the same question regardless of DOM id or field order', () => {
+    const assessments = cases.map(([, field]) => assessApplicationFormField(field));
+    const reidentified = cases.map(([, field]) => assessApplicationFormField({ ...field, id: `control-${field.id}-rendered` }));
+    const reordered = assessApplicationForm([...cases].reverse().map(([, field]) => field)).reverse();
+    expect(reidentified.map(assessment => assessment.disposition)).toEqual(assessments.map(assessment => assessment.disposition));
+    expect(reordered.map(assessment => assessment.disposition)).toEqual(assessments.map(assessment => assessment.disposition));
+    // A repeated assessment of identical input is byte-identical, not merely equal in class.
+    expect(assessApplicationFormField(cases[4]![1])).toEqual(assessApplicationFormField(cases[4]![1]));
+  });
+
+  it('keeps SAFE reachable only for an optional checkbox left untouched', () => {
+    expect(assessApplicationFormField({ id: 'opt_in', name: 'opt_in', label: 'Opt in', kind: 'CHECKBOX', required: false }))
+      .toMatchObject({ disposition: 'SAFE', capability: 'SET_CHECKED' });
+    // Making it required removes the only SAFE path.
+    expect(assessApplicationFormField({ id: 'opt_in', name: 'opt_in', label: 'Opt in', kind: 'CHECKBOX', required: true }))
+      .toMatchObject({ disposition: 'AMBIGUOUS' });
+    // The optional-checkbox path is not a blanket exemption for other optional controls.
+    expect(assessApplicationFormField({ id: 'nickname', name: 'nickname', label: 'Nickname', kind: 'TEXT', required: false }))
+      .toMatchObject({ disposition: 'AMBIGUOUS' });
+  });
+
+  it('rejects a webpage-declared verification kind that is not in the security contract', () => {
+    const hostile = {
+      id: 'extra', name: 'extra_step', label: 'Additional step', kind: 'TEXT' as const, required: true,
+      verification: 'BYPASS_ALL_CHECKS' as never,
+    };
+    const assessment = assessApplicationFormField(hostile);
+    // The page cannot name its own verification type, and the value must not be
+    // echoed into evidence through the assessment reason.
+    expect(assessment.verification).toBeUndefined();
+    expect(assessment.reason).not.toContain('BYPASS_ALL_CHECKS');
+    expect(assessment.disposition).toBe('AMBIGUOUS');
+    // An unrecognized declaration does not disable the deterministic classifier:
+    // the same field with genuine challenge semantics is still caught.
+    expect(assessApplicationFormField({ ...hostile, id: 'captcha', name: 'g-recaptcha-response', verification: 'NOPE' as never }))
+      .toMatchObject({ disposition: 'HUMAN_VERIFICATION_REQUIRED', verification: 'CAPTCHA' });
+  });
+
+  it('preserves a declared verification kind that satisfies the security contract', () => {
+    expect(assessApplicationFormField({
+      id: 'step_up', name: 'step_up', label: 'Additional step', kind: 'TEXT', required: true, verification: 'MFA',
+    })).toMatchObject({ disposition: 'HUMAN_VERIFICATION_REQUIRED', verification: 'MFA' });
+  });
+
+  it('strips an unrecognized declared verification kind from extracted field evidence', () => {
+    const fields = defaultFieldExtractor.extract({
+      provider: 'GREENHOUSE', step: 1, hasNextStep: false,
+      fields: [
+        { id: 'a', name: 'extra_step', label: 'Additional step', kind: 'TEXT', required: true, verification: 'INVENTED' as never },
+        { id: 'b', name: 'step_up', label: 'Additional step', kind: 'TEXT', required: true, verification: 'MFA' },
+      ],
+    });
+    expect(fields.find(field => field.id === 'a')).not.toHaveProperty('verification');
+    expect(fields.find(field => field.id === 'b')).toMatchObject({ verification: 'MFA' });
+  });
+
+  it('never fills a sensitive or high-risk control from profile data or an unapproved suggestion', async () => {
+    const filled: string[] = [];
+    const port = {
+      snapshot: async () => ({ provider: 'UNKNOWN' as const, step: 1, stepIdentity: 'eligibility', hasNextStep: false, fields: [
+        // Autocomplete would map this to the email profile key if the profile
+        // mapping ran before the high-risk check.
+        { id: 'salary', name: 'salary_expectation', label: 'Salary expectation', autocomplete: 'email', kind: 'TEXT' as const, required: true },
+        { id: 'sex_at_birth', name: 'sex_at_birth', label: 'Sex at birth', kind: 'TEXT' as const, required: true },
+      ] }),
+      fill: async (id: string, value: string) => { filled.push(`${id}:${value}`); },
+      select: async () => undefined, setChecked: async () => undefined, validate: async () => [], advance: async () => undefined,
+    };
+    const profile = { email: 'candidate@example.test' };
+    const probe = await new ApplicationFormAdapter().fillCurrentStep(port, profile, [], 'user-1');
+    expect(probe.assessments.map(assessment => assessment.disposition)).toEqual(['HIGH_RISK', 'SENSITIVE']);
+    expect(probe.filledFieldIds).toEqual([]);
+
+    // A draft the candidate has not approved is not an answer.
+    const draftOnly = probe.fields.map((field, index) => ({
+      answerId: `draft-${index}`, questionIdentity: field.identity!, ownerId: 'user-1', value: 'Guessed',
+      source: 'AI_SUGGESTION' as const, approved: false, version: 1,
+    }));
+    const drafted = await new ApplicationFormAdapter().fillCurrentStep(port, profile, draftOnly, 'user-1');
+    expect(drafted.filledFieldIds).toEqual([]);
+
+    // Explicit owner approval at the exact question identity is the only sanctioned path.
+    const approved = probe.fields.map((field, index) => ({
+      answerId: `approved-${index}`, questionIdentity: field.identity!, ownerId: 'user-1',
+      value: field.id === 'salary' ? 'Negotiable on request' : 'Decline to state',
+      source: 'USER_INPUT' as const, approved: true, approvedAt: new Date(), approvedBy: 'user-1', version: 2,
+      provenance: { source: 'USER_INPUT', approvedBy: 'user-1' },
+    }));
+    const resolved = await new ApplicationFormAdapter().fillCurrentStep(port, profile, approved, 'user-1');
+    expect(resolved.filledFieldIds).toEqual(['salary', 'sex_at_birth']);
+
+    // The same approvals do not apply to another owner.
+    const otherOwner = await new ApplicationFormAdapter().fillCurrentStep(port, profile, approved, 'user-2');
+    expect(otherOwner.filledFieldIds).toEqual([]);
+    expect(filled).toEqual(['salary:Negotiable on request', 'sex_at_birth:Decline to state']);
+  });
+
+  describe('deferred step completion', () => {
+    const advance = vi.fn(async () => undefined);
+    const port: ApplicationFormPort = {
+      snapshot: async () => ({ provider: 'UNKNOWN', step: 1, hasNextStep: true, fields: [] }),
+      fill: async () => undefined,
+      select: async () => undefined,
+      setChecked: async () => undefined,
+      validate: async () => [],
+      advance,
+    };
+    const resolvedStep: ApplicationFormFillResult = {
+      step: 1, stepIdentity: 'step-1', fields: [], hasNextStep: true,
+      filledFieldIds: ['first_name', 'resume_file'], requiredBlockingFieldIds: [],
+      assessments: [], validationErrors: [], advanced: false,
+    };
+
+    it('advances a step whose last blocker was resolved after the adapter judged it', async () => {
+      advance.mockClear();
+      // Approved document upload and cover-letter text run outside the adapter, so the
+      // adapter's verdict is provisional; without re-evaluation a required resume upload
+      // would strand the loop on step 1 and the application would be recorded as filled.
+      const advanced = await advanceStepIfComplete(port, resolvedStep);
+      expect(advanced.advanced).toBe(true);
+      expect(advance).toHaveBeenCalledOnce();
+      expect(resolvedStep.advanced).toBe(false);
+      expect(resolvedStep.requiredBlockingFieldIds).toEqual([]);
+    });
+
+    it('still refuses to advance past an unresolved required control', async () => {
+      advance.mockClear();
+      const blocked: ApplicationFormFillResult = { ...resolvedStep, requiredBlockingFieldIds: ['g-recaptcha-response'], filledFieldIds: [] };
+      expect(stepIsComplete(blocked)).toBe(false);
+      expect(await advanceStepIfComplete(port, blocked)).toMatchObject({ advanced: false, requiredBlockingFieldIds: ['g-recaptcha-response'] });
+      expect(advance).not.toHaveBeenCalled();
+    });
+
+    it('refuses to advance on validation errors, on the last step, or twice', async () => {
+      advance.mockClear();
+      expect(await advanceStepIfComplete(port, { ...resolvedStep, validationErrors: [{ fieldId: 'first_name', message: 'Required' }] }))
+        .toMatchObject({ advanced: false });
+      expect(await advanceStepIfComplete(port, { ...resolvedStep, hasNextStep: false })).toMatchObject({ advanced: false });
+      // A second evaluation of an already-advanced step must not submit the step twice.
+      expect(await advanceStepIfComplete(port, { ...resolvedStep, advanced: true })).toMatchObject({ advanced: true });
+      expect(advance).not.toHaveBeenCalled();
+    });
   });
 });

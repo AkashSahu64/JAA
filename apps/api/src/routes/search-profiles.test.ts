@@ -27,4 +27,16 @@ describe('search profile schedule validation', () => {
   ])('rejects unsafe durable profile text: %j', override => {
     expect(validateProfile({ name: 'Engineering', ...override }, false)).not.toBeNull();
   });
+
+  it.each([0, null, -1, 1.5, 10_001])('rejects an out-of-range or non-integer daily application limit: %j', maxApplicationsPerDay => {
+    expect(validateProfile({ name: 'Engineering', maxApplicationsPerDay }, false)).toBe('maxApplicationsPerDay must be an integer from 1 to 10000');
+  });
+
+  it('accepts a positive integer daily application limit', () => {
+    expect(validateProfile({ name: 'Engineering', maxApplicationsPerDay: 1 }, false)).toBeNull();
+  });
+
+  it.each([null, 'true', 1])('rejects a non-boolean active flag: %j', isActive => {
+    expect(validateProfile({ name: 'Engineering', isActive }, false)).toBe('isActive must be a boolean');
+  });
 });

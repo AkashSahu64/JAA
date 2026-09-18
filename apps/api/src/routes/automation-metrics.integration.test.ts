@@ -35,6 +35,6 @@ describeDatabase.sequential('live tenant automation metrics', () => {
     const response = await fetch(`${baseUrl}/api/automation/metrics`, { headers: { authorization: `Bearer ${generateToken({ userId, email: `${userId}@example.invalid` })}` } });
     expect(response.status).toBe(200);
     const body = await response.json() as { success: boolean; data: { jobs: unknown[]; attempts: unknown[]; failures: unknown[]; browserSessions: unknown[]; pendingVerification: { pendingCount: number }; alerts: unknown[] } };
-    expect(body).toMatchObject({ success: true, data: { jobs: [], attempts: [], failures: [], browserSessions: [], pendingVerification: { pendingCount: 0 }, alerts: [] } });
+    expect(body).toMatchObject({ success: true, data: { jobs: [], attempts: [], failures: [], browserSessions: [], pendingVerification: { pendingCount: 0 }, alerts: expect.any(Array) } });
   });
 });

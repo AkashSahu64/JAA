@@ -106,7 +106,7 @@ function processor(options: StartAutomationWorkerOptions): AutomationProcessor {
       writeStructuredLog('info', {
         event: 'automation.job_execution_duration', automationJobId: job.id, userId: job.userId,
         correlationId: job.correlationId, jobType: job.type, attempt: job.attemptCount,
-        workerId: context.workerId, durationMs: Math.max(0, Date.now() - startedAt), ...jobTraceContext(job),
+        workerId: context.workerId, queue: options.name, durationMs: Math.max(0, Date.now() - startedAt), ...jobTraceContext(job),
       });
     }
     return { outcome: 'EXECUTED' as const };
@@ -131,7 +131,7 @@ export function startAutomationWorker(options: StartAutomationWorkerOptions): Au
       writeStructuredLog('error', {
         event: 'automation.lease_renewal_failure', automationJobId: message.automationJobId,
         correlationId: message.correlationId, jobType: message.type,
-        errorName: error.name, errorMessage: safeErrorMessage(error), workerId: options.workerId,
+        errorName: error.name, errorMessage: safeErrorMessage(error), workerId: options.workerId, queue: options.name,
       });
     },
     onWorkerError: (error) => {
@@ -171,7 +171,7 @@ export function startAutomationWorker(options: StartAutomationWorkerOptions): Au
         event: 'automation.job_failure', automationJobId: message.automationJobId,
         correlationId: message.correlationId, jobType: message.type,
         attempt: message.dispatchAttempt, errorName: failure.name,
-        errorMessage: safeErrorMessage(failure), retryDelayMs, workerId: options.workerId,
+        errorMessage: safeErrorMessage(failure), retryDelayMs, workerId: options.workerId, queue: options.name,
         ...(job ? jobTraceContext(job) : {}),
       });
       if (!job) return 'IGNORED';

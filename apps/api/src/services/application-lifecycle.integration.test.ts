@@ -49,6 +49,8 @@ describeDatabase.sequential('durable interview and offer lifecycle', () => {
 
     const decided = await decideOffer({ userId, applicationId, offerId: offer.id, decision: 'ACCEPTED', sourceEventId: `decision-${randomUUID()}` });
     expect(decided.status).toBe('ACCEPTED');
+    await expect(recordInterview(interviewInput)).resolves.toMatchObject({ id: interview.id });
+    await expect(recordOffer(offerInput)).resolves.toMatchObject({ id: offer.id });
     await expect(prisma.application.findUniqueOrThrow({ where: { id: applicationId } })).resolves.toMatchObject({ status: 'ACCEPTED', version: 4 });
     await expect(prisma.auditLog.count({ where: { userId, resource: 'Interview', resourceId: interview.id } })).resolves.toBe(1);
     await expect(prisma.auditLog.count({ where: { userId, resource: 'Offer', resourceId: offer.id } })).resolves.toBe(2);

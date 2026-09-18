@@ -1,7 +1,7 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { encrypt, decrypt } from '@jobagent/security';
-import { withTenant } from '@jobagent/database';
-import { EMAIL_PROVIDERS, EmailProvider } from './email-connections';
+import { withService, withTenant } from '@jobagent/database';
+import { EMAIL_PROVIDERS, EmailProvider, validateApprovedEmailScopes } from './email-connections';
 
 const STATE_TTL_MS = 10 * 60 * 1_000;
 const MAX_REDIRECT_URI_LENGTH = 2_000;
@@ -33,6 +33,15 @@ function safeText(value: unknown, max: number, name: string): string {
   return value.trim();
 }
 
+function redirectOriginAllowed(url: URL): boolean {
+  const configured = process.env.OAUTH_ALLOWED_REDIRECT_ORIGINS?.split(',').map(value => value.trim()).filter(Boolean) ?? [];
+  if (configured.length > 0) return configured.includes(url.origin);
+  if (process.env.NODE_ENV !== 'production') return true;
+  const frontend = process.env.FRONTEND_URL?.trim();
+  if (!frontend) return false;
+  try { return new URL(frontend).origin === url.origin; } catch { return false; }
+}
+
 function validateInput(input: EmailOAuthStateInput): void {
   if (!input || typeof input !== 'object') throw new Error('OAuth input is invalid');
   safeText(input.userId, 200, 'OAuth owner');
@@ -42,7 +51,9 @@ function validateInput(input: EmailOAuthStateInput): void {
   let url: URL;
   try { url = new URL(redirect); } catch { throw new Error('OAuth redirect URI is invalid'); }
   if ((url.protocol !== 'https:' && url.hostname !== 'localhost' && url.hostname !== '127.0.0.1') || url.username || url.password || url.hash) throw new Error('OAuth redirect URI must use HTTPS without credentials or fragments');
+  if (!redirectOriginAllowed(url)) throw new Error('OAuth redirect URI is not allowlisted');
   if (!Array.isArray(input.scopes) || input.scopes.length > 50 || input.scopes.some(scope => typeof scope !== 'string' || !scope.trim() || scope.length > 200 || Array.from(scope).some(character => character.charCodeAt(0) < 32 || character.charCodeAt(0) === 127))) throw new Error('OAuth scopes are invalid');
+  validateApprovedEmailScopes(input.provider, input.scopes);
 }
 
 export async function createEmailOAuthState(input: EmailOAuthStateInput) {
@@ -66,5 +77,18 @@ export async function consumeEmailOAuthState(userId: string, state: string, now 
     const consumed = await tx.emailOAuthState.updateMany({ where: { id: record.id, userId: owner, consumedAt: null, expiresAt: { gt: now } }, data: { consumedAt: now } });
     if (consumed.count !== 1) return null;
     return { id: record.id, userId: record.userId, provider: record.provider as EmailProvider, redirectUri: record.redirectUri, accountLabel: record.accountLabel, scopes: record.scopes, codeVerifier: decrypt(record.encryptedCodeVerifier) };
+  });
+}
+
+/** Resolve the owner of a one-time opaque callback capability before tenant entry. */
+export async function resolveEmailOAuthStateOwner(state: string, now = new Date()): Promise<string | null> {
+  const rawState = safeText(state, 512, 'OAuth state');
+  if (!(now instanceof Date) || !Number.isFinite(now.getTime())) throw new Error('OAuth state time is invalid');
+  return withService(async tx => {
+    const record = await tx.emailOAuthState.findFirst({
+      where: { stateHash: opaqueHash(rawState), consumedAt: null, expiresAt: { gt: now } },
+      select: { userId: true, provider: true, accountLabel: true },
+    });
+    return record && EMAIL_PROVIDERS.includes(record.provider as EmailProvider) && record.accountLabel?.trim() ? record.userId : null;
   });
 }

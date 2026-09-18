@@ -206,9 +206,10 @@ export async function attachDocumentToApplicationInTransaction(
   if (!metadata || metadata.resumeVersionId !== input.resumeVersionId) {
     throw new DocumentStorageError('INVALID_DOCUMENT', 'Document is not the exact approved object for this resume version');
   }
-  if (metadata.approvalStatus !== 'APPROVED' || !metadata.approvedAt || metadata.approvedBy !== input.userId) {
+  if (metadata.approvalStatus !== 'APPROVED' || !(metadata.approvedAt instanceof Date) || !Number.isFinite(metadata.approvedAt.getTime()) || metadata.approvedBy !== input.userId) {
     throw new DocumentStorageError('INVALID_DOCUMENT', 'Document has not been explicitly approved by the authenticated owner');
   }
+  requireValidExpiry(metadata.expiresAt);
   const allowedKinds: Record<typeof input.type, readonly DocumentArtifactKind[]> = {
     resume: ['RESUME_SOURCE', 'RESUME_APPROVED', 'RESUME_TAILORED'],
     cover_letter: ['COVER_LETTER'],
@@ -325,7 +326,9 @@ function isS3BucketName(value: string): boolean {
 }
 
 function validateDocumentOwner(userId: string): void {
-  if (!userId.trim() || userId !== userId.trim() || userId.includes('/') || userId.includes('\\') || hasControlCharacters(userId)) {
+  if (!userId.trim() || userId !== userId.trim() || userId === '.' || userId === '..'
+    || !/^[A-Za-z0-9._:-]{1,200}$/.test(userId)
+    || userId.includes('/') || userId.includes('\\') || hasControlCharacters(userId)) {
     throw new DocumentStorageError('INVALID_DOCUMENT', 'Document owner is required and must be a single safe path segment');
   }
 }
@@ -388,7 +391,8 @@ export function validateStoredDocumentMetadata(input: {
   if (input.kind !== undefined && !DOCUMENT_ARTIFACT_KINDS.includes(input.kind as DocumentArtifactKind)) {
     throw new DocumentStorageError('INVALID_DOCUMENT', 'Stored document kind is unsupported');
   }
-  if (input.userId !== undefined && (input.userId !== input.userId.trim() || hasControlCharacters(input.userId) || pathParts[2] !== input.userId)) {
+  if (input.userId !== undefined) validateDocumentOwner(input.userId);
+  if (input.userId !== undefined && pathParts[2] !== input.userId) {
     throw new DocumentStorageError('INVALID_DOCUMENT', 'Stored document owner does not match its private object path');
   }
   if (expected.userId !== undefined && (input.userId !== expected.userId || pathParts[2] !== expected.userId)) {
@@ -418,8 +422,14 @@ function requireStoredEncryptionReference(stored: { encryptionKeyRef?: string | 
 }
 
 function requireApprovedDocument(stored: { approvalStatus?: string; approvedAt?: Date | null; approvedBy?: string | null }, ownerId: string): void {
-  if (stored.approvalStatus !== 'APPROVED' || !stored.approvedAt || stored.approvedBy !== ownerId) {
+  if (stored.approvalStatus !== 'APPROVED' || !(stored.approvedAt instanceof Date) || !Number.isFinite(stored.approvedAt.getTime()) || stored.approvedBy !== ownerId) {
     throw new DocumentStorageError('INVALID_DOCUMENT', 'Only an explicitly owner-approved document may be read by a worker');
+  }
+}
+
+function requireValidExpiry(value: Date | null | undefined): void {
+  if (value !== undefined && value !== null && (!(value instanceof Date) || !Number.isFinite(value.getTime()))) {
+    throw new DocumentStorageError('INVALID_DOCUMENT', 'Stored document expiry metadata is invalid');
   }
 }
 
@@ -550,13 +560,13 @@ export class DocumentStorage {
       if (!matchesStoredEncryption(head, stored.encryptionKeyRef!)) {
         throw new DocumentStorageError('INVALID_DOCUMENT', 'Stored document encryption does not match its immutable metadata');
       }
-      if (head.ContentLength !== undefined && head.ContentLength !== expectedBytes) {
+      if (head.ContentLength !== expectedBytes) {
         throw new DocumentStorageError('INVALID_DOCUMENT', 'Stored document size does not match its immutable metadata');
       }
-      if (head.ContentType !== undefined && head.ContentType !== expectedType) {
+      if (head.ContentType !== expectedType) {
         throw new DocumentStorageError('INVALID_DOCUMENT', 'Stored document MIME type does not match its immutable metadata');
       }
-      if (head.Metadata?.sha256 !== undefined && head.Metadata.sha256.toLowerCase() !== stored.checksumSha256.toLowerCase()) {
+      if (head.Metadata?.sha256?.toLowerCase() !== stored.checksumSha256.toLowerCase()) {
         throw new DocumentStorageError('INVALID_DOCUMENT', 'Stored document checksum metadata does not match its immutable metadata');
       }
       const response = await client.send(new GetObjectCommand({ Bucket: stored.bucket, Key: stored.objectKey, VersionId: stored.versionId ?? undefined }));
@@ -583,6 +593,7 @@ export class DocumentStorage {
     if (stored.userId !== userId) throw new DocumentStorageError('INVALID_DOCUMENT', 'Document metadata is not owned by the authenticated user');
     if (stored.scanStatus !== undefined && stored.scanStatus !== 'CLEAN') throw new DocumentStorageError('INVALID_DOCUMENT', 'Only clean documents may be read');
     if (stored.deletedAt !== undefined && stored.deletedAt !== null) throw new DocumentStorageError('INVALID_DOCUMENT', 'Deleted documents may not be read');
+    requireValidExpiry(stored.expiresAt);
     if (stored.expiresAt !== undefined && stored.expiresAt !== null && stored.expiresAt <= new Date()) throw new DocumentStorageError('INVALID_DOCUMENT', 'Expired documents may not be read');
     requireApprovedDocument(stored, userId);
     requireStoredEncryptionReference(stored);
@@ -621,6 +632,7 @@ export class DocumentStorage {
     if (stored.userId !== userId) throw new DocumentStorageError('INVALID_DOCUMENT', 'Document metadata is not owned by the authenticated user');
     if (stored.scanStatus !== 'CLEAN') throw new DocumentStorageError('INVALID_DOCUMENT', 'Only clean documents may be signed');
     if (stored.deletedAt !== null) throw new DocumentStorageError('INVALID_DOCUMENT', 'Deleted documents may not be signed');
+    requireValidExpiry(stored.expiresAt);
     if (stored.expiresAt !== null && stored.expiresAt <= new Date()) throw new DocumentStorageError('INVALID_DOCUMENT', 'Expired documents may not be signed');
     requireStoredEncryptionReference(stored);
     validateStoredDocumentMetadata(stored, { userId });
@@ -631,7 +643,14 @@ export class DocumentStorage {
   private async createSignedDownloadUrl(stored: { bucket: string; objectKey: string; versionId?: string | null; fileName: string; mimeType: string }): Promise<string> {
     const { client, bucket } = this.config();
     if (stored.bucket !== bucket) throw new DocumentStorageError('INVALID_DOCUMENT', 'Stored document belongs to a different private bucket');
-    return getSignedUrl(client, new GetObjectCommand({ Bucket: stored.bucket, Key: stored.objectKey, VersionId: stored.versionId ?? undefined, ResponseContentType: stored.mimeType, ResponseContentDisposition: `attachment; filename="${safeDownloadFileName(stored.fileName)}"` }), { expiresIn: DOWNLOAD_TTL_SECONDS });
+    return getSignedUrl(client, new GetObjectCommand({
+      Bucket: stored.bucket,
+      Key: stored.objectKey,
+      VersionId: stored.versionId ?? undefined,
+      ResponseContentType: stored.mimeType,
+      ResponseContentDisposition: `attachment; filename="${safeDownloadFileName(stored.fileName)}"`,
+      ResponseCacheControl: 'no-store',
+    }), { expiresIn: DOWNLOAD_TTL_SECONDS });
   }
 
   async signedDownloadUrlAuthorized(userId: string, stored: { userId?: string; bucket: string; objectKey: string; versionId?: string | null; fileName: string; mimeType: string; checksumSha256: string; byteSize: bigint; encryptionKeyRef?: string | null; scanStatus?: string; deletedAt?: Date | null; expiresAt?: Date | null }): Promise<string> {
@@ -639,6 +658,7 @@ export class DocumentStorage {
     if (stored.userId !== userId) throw new DocumentStorageError('INVALID_DOCUMENT', 'Document metadata is not owned by the authenticated user');
     if (stored.scanStatus !== undefined && stored.scanStatus !== 'CLEAN') throw new DocumentStorageError('INVALID_DOCUMENT', 'Only clean documents may be signed');
     if (stored.deletedAt !== undefined && stored.deletedAt !== null) throw new DocumentStorageError('INVALID_DOCUMENT', 'Deleted documents may not be signed');
+    requireValidExpiry(stored.expiresAt);
     if (stored.expiresAt !== undefined && stored.expiresAt !== null && stored.expiresAt <= new Date()) throw new DocumentStorageError('INVALID_DOCUMENT', 'Expired documents may not be signed');
     requireStoredEncryptionReference(stored);
     validateStoredDocumentMetadata(stored, { userId });

@@ -34,6 +34,13 @@ router.get('/:id/download-url', async (req: AuthenticatedRequest, res: Response)
     }));
     if (!object) return res.status(404).json({ success: false, error: 'Document not found' });
     const url = await documentStorage.signedDownloadUrlAuthorized(req.user!.userId, object);
+    await withTenant(req.user!.userId, tx => tx.auditLog.create({ data: {
+      userId: req.user!.userId,
+      action: 'DOCUMENT_DOWNLOAD_AUTHORIZED',
+      resource: 'ObjectMetadata',
+      resourceId: req.params.id,
+      details: { checksumSha256: object.checksumSha256, objectKey: object.objectKey, expiresInSeconds: 300 },
+    } }));
     return res.json({ success: true, data: { url, expiresInSeconds: 300 } });
   } catch (error) {
     logRouteError('document.download_url_failure', error, { correlationId: req.get('x-correlation-id'), userId: req.user?.userId });

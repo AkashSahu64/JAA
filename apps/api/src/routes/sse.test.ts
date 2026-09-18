@@ -1,9 +1,14 @@
 import { describe, expect, it } from 'vitest';
-import { deduplicateReplayedEvents, hasSseCapacity, isSafeSseToken, MAX_SSE_CONNECTIONS_PER_USER, serializeSseData } from './sse';
+import { deduplicateReplayedEvents, hasSseCapacity, isSafeSseToken, MAX_SSE_CONNECTIONS_PER_USER, serializeSseData, shouldPruneSseClient, SSE_RESPONSE_HEADERS, writeSseHeartbeat } from './sse';
 
 describe('SSE payload boundary', () => {
   it('serializes bounded JSON data', () => {
     expect(serializeSseData({ event: 'notification', count: 1 })).toBe('{"event":"notification","count":1}');
+  });
+
+  it('prevents intermediary and browser caching of tenant event streams', () => {
+    expect(SSE_RESPONSE_HEADERS['Cache-Control']).toBe('no-store, no-cache, no-transform');
+    expect(SSE_RESPONSE_HEADERS['Content-Type']).toBe('text/event-stream');
   });
 
   it('rejects circular and oversized payloads', () => {
@@ -48,5 +53,23 @@ describe('SSE payload boundary', () => {
       { id: 'notification-1', type: 'notification', data: 1 },
       { type: 'notification', data: 2 },
     ]);
+  });
+
+  it('prunes already-ended responses before counting live capacity', () => {
+    expect(shouldPruneSseClient(true)).toBe(true);
+    expect(shouldPruneSseClient(false)).toBe(false);
+    expect(shouldPruneSseClient(undefined)).toBe(false);
+  });
+
+  it('fails closed when a disconnected client throws during heartbeat delivery', () => {
+    const write = () => { throw new Error('socket closed'); };
+    expect(writeSseHeartbeat({ writableEnded: false, write })).toBe(false);
+    expect(writeSseHeartbeat({ writableEnded: true, write })).toBe(false);
+  });
+
+  it('writes a heartbeat only to an open response', () => {
+    const writes: string[] = [];
+    expect(writeSseHeartbeat({ writableEnded: false, write: value => { writes.push(value); return true; } })).toBe(true);
+    expect(writes).toEqual([': heartbeat\n\n']);
   });
 });

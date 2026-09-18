@@ -6,24 +6,35 @@ function hasControlCharacters(value: string): boolean {
   return Array.from(value).some(character => character.charCodeAt(0) < 32 || character.charCodeAt(0) === 127);
 }
 
-export interface CredentialRecordInput { userId: string; name: string; value: string; }
+export interface CredentialRecordInput { userId: string; name: string; value: string; expectedVersion?: number; }
 
 export function validateCredentialRecordInput(input: CredentialRecordInput): void {
   if (!input || typeof input.userId !== 'string' || hasControlCharacters(input.userId) || !/^[A-Za-z0-9._:-]{1,200}$/.test(input.userId)) throw new Error('Credential owner is required');
   if (typeof input.name !== 'string' || hasControlCharacters(input.name) || !input.name.trim() || input.name.trim().length > 200) throw new Error('Credential name must be between 1 and 200 characters');
   if (typeof input.value !== 'string' || !input.value || input.value.length > 100_000) throw new Error('Credential value must be between 1 and 100000 characters');
+  if (input.expectedVersion !== undefined && (!Number.isSafeInteger(input.expectedVersion) || input.expectedVersion < 1)) throw new Error('Credential version is invalid');
 }
 
 export async function storeDurableCredential(input: CredentialRecordInput) {
   validateCredentialRecordInput(input);
   const name = input.name.trim();
   return withTenant(input.userId, async (tx) => {
-    const record = await tx.credentialRecord.upsert({
-      where: { userId_name: { userId: input.userId, name } },
-      create: { id: randomUUID(), userId: input.userId, name, encryptedValue: encrypt(input.value), version: 1, revokedAt: null },
-      update: { encryptedValue: encrypt(input.value), version: { increment: 1 }, revokedAt: null },
-      select: { id: true, userId: true, name: true, version: true, revokedAt: true, createdAt: true, updatedAt: true },
-    });
+    const encryptedValue = encrypt(input.value);
+    let record;
+    if (input.expectedVersion === undefined) {
+      record = await tx.credentialRecord.upsert({
+        where: { userId_name: { userId: input.userId, name } },
+        create: { id: randomUUID(), userId: input.userId, name, encryptedValue, version: 1, revokedAt: null },
+        update: { encryptedValue, version: { increment: 1 }, revokedAt: null },
+        select: { id: true, userId: true, name: true, version: true, revokedAt: true, createdAt: true, updatedAt: true },
+      });
+    } else {
+      const current = await tx.credentialRecord.findFirst({ where: { userId: input.userId, name, revokedAt: null }, select: { id: true, version: true } });
+      if (!current || current.version !== input.expectedVersion) throw new Error('Credential changed during refresh');
+      const changed = await tx.credentialRecord.updateMany({ where: { id: current.id, userId: input.userId, version: input.expectedVersion, revokedAt: null }, data: { encryptedValue, version: { increment: 1 } } });
+      if (changed.count !== 1) throw new Error('Credential changed during refresh');
+      record = await tx.credentialRecord.findFirstOrThrow({ where: { id: current.id, userId: input.userId }, select: { id: true, userId: true, name: true, version: true, revokedAt: true, createdAt: true, updatedAt: true } });
+    }
     await tx.auditLog.create({ data: { userId: input.userId, action: 'CREDENTIAL_STORED', resource: 'CredentialRecord', resourceId: record.id, details: { name, version: record.version, plaintextPersisted: false } } });
     return record;
   });

@@ -10,10 +10,18 @@ const postgresContainer = process.env.POSTGRES_CONTAINER ?? 'job-application-age
 const owner = '00000000-0000-4000-8000-000000000001';
 const prisma = new PrismaClient();
 const createdJobIds = new Set<string>();
+const insertedDiscoveryRunIds = new Set<string>();
 
 afterAll(async () => {
-  if (integrationEnabled && createdJobIds.size > 0) {
-    await prisma.job.deleteMany({ where: { id: { in: [...createdJobIds] } } });
+  if (integrationEnabled) {
+    // Order matters: discovery items and runs reference jobs, so they go first.
+    if (insertedDiscoveryRunIds.size > 0) {
+      const runIds = [...insertedDiscoveryRunIds].map(id => `'${id}'`).join(',');
+      sql(`DELETE FROM job_discovery_items WHERE "runId" IN (${runIds}); DELETE FROM job_discovery_runs WHERE id IN (${runIds})`);
+    }
+    if (createdJobIds.size > 0) {
+      await prisma.job.deleteMany({ where: { id: { in: [...createdJobIds] } } });
+    }
   }
   await prisma.$disconnect();
 });
@@ -112,6 +120,12 @@ describeDatabase('Goal 7 discovery database hardening', () => {
     const runId = randomUUID();
     const canonicalJobId = randomUUID();
     const otherJobId = randomUUID();
+    // These rows are inserted by raw SQL rather than through `createdJobIds`, so the
+    // shared cleanup below cannot see them. `job_discovery_items` references both
+    // jobs, so the items and the run must be removed before the jobs themselves.
+    insertedDiscoveryRunIds.add(runId);
+    createdJobIds.add(canonicalJobId);
+    createdJobIds.add(otherJobId);
     sql(`
       INSERT INTO job_discovery_runs (id, "userId", source, "sourceAccount", "requestKey", query, "createdAt", "updatedAt") VALUES ('${runId}', '${owner}', 'GREENHOUSE', 'fixture-account', '${randomUUID()}', '{}', now(), now());
       ${createJobStatement(canonicalJobId)};

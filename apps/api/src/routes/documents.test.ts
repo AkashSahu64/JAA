@@ -169,6 +169,9 @@ describe('document artifact upload route', () => {
     expect(mocks.objectMetadata.findFirst).toHaveBeenCalledWith(expect.objectContaining({
       select: expect.objectContaining({ scanStatus: true, deletedAt: true, expiresAt: true }),
     }));
+    expect(mocks.tx.auditLog.create).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({ action: 'DOCUMENT_DOWNLOAD_AUTHORIZED', resourceId: 'object-1', details: expect.objectContaining({ checksumSha256: 'a'.repeat(64) }) }),
+    }));
     await expect(response.json()).resolves.toMatchObject({ success: true, data: { url: 'https://signed.example/download', expiresInSeconds: 300 } });
   });
 
@@ -238,5 +241,121 @@ describe('document artifact upload route', () => {
     const response = await fetch(`${baseUrl}/upload`, { method: 'POST', headers: { authorization: 'Bearer tenant-user-1' }, body: form });
     expect(response.status).toBe(413);
     expect(mocks.storeArtifact).not.toHaveBeenCalled();
+  });
+});
+
+describe('document route authorization matrix', () => {
+  let server: Server;
+  let baseUrl: string;
+
+  const uploadForm = () => {
+    const form = new FormData();
+    form.set('kind', 'SCREENSHOT');
+    form.set('applicationId', 'application-1');
+    form.set('document', new Blob([Buffer.from([0x89, 0x50, 0x4e, 0x47])], { type: 'image/png' }), 'confirmation.png');
+    return form;
+  };
+
+  beforeEach(async () => {
+    vi.clearAllMocks();
+    mocks.tx.application.findFirst.mockResolvedValue({ id: 'application-1', resumeVersionId: 'resume-version-1' });
+    mocks.tx.applicationDocument.findFirst.mockResolvedValue(null);
+    mocks.objectMetadata.findFirst.mockResolvedValue(null);
+    mocks.objectMetadata.updateMany.mockResolvedValue({ count: 1 });
+    mocks.storeArtifact.mockResolvedValue({ kind: 'SCREENSHOT', bucket: 'private', objectKey: 'private/screenshot/user-1/' + 'a'.repeat(64), fileName: 'confirmation.png', mimeType: 'image/png', byteSize: 9, checksumSha256: 'a'.repeat(64), encryptionKeyRef: 'S3_MANAGED', scanStatus: 'CLEAN', scanDetails: {} });
+    const app = express();
+    app.use('/api/documents', documentRoutes);
+    server = app.listen(0, '127.0.0.1');
+    await new Promise<void>((resolve, reject) => { server.once('listening', resolve); server.once('error', reject); });
+    const address = server.address() as AddressInfo;
+    baseUrl = `http://127.0.0.1:${address.port}/api/documents`;
+  });
+
+  afterEach(async () => { await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())); });
+
+  it('refuses every document endpoint without a bearer token', async () => {
+    const [download, remove, approve, upload] = await Promise.all([
+      fetch(`${baseUrl}/object-1/download-url`),
+      fetch(`${baseUrl}/object-1`, { method: 'DELETE' }),
+      fetch(`${baseUrl}/object-1/approve`, { method: 'POST' }),
+      fetch(`${baseUrl}/upload`, { method: 'POST', body: uploadForm() }),
+    ]);
+
+    for (const response of [download, remove, approve, upload]) {
+      expect(response.status).toBe(401);
+    }
+    // No storage or metadata side effect may occur before authentication.
+    expect(mocks.signedDownloadUrlAuthorized).not.toHaveBeenCalled();
+    expect(mocks.deleteAuthorized).not.toHaveBeenCalled();
+    expect(mocks.storeArtifact).not.toHaveBeenCalled();
+    expect(mocks.approvePublic).not.toHaveBeenCalled();
+  });
+
+  it('scopes the download lookup so expired, deleted, and quarantined objects cannot be presigned', async () => {
+    await fetch(`${baseUrl}/object-1/download-url`, { headers: { authorization: 'Bearer tenant-user-1' } });
+
+    // The row filter, not a post-hoc check, is what makes these fail closed.
+    const query = mocks.objectMetadata.findFirst.mock.calls[0][0];
+    expect(query.where).toMatchObject({ id: 'object-1', userId: 'user-1', deletedAt: null, scanStatus: 'CLEAN' });
+    expect(query.where.OR).toEqual([{ expiresAt: null }, { expiresAt: { gt: expect.any(Date) } }]);
+  });
+
+  it('returns 404 rather than presigning when the document is not clean, deleted, or expired', async () => {
+    // The scoped query returns nothing in each of these cases.
+    for (const reason of ['quarantined', 'deleted', 'expired']) {
+      mocks.objectMetadata.findFirst.mockResolvedValueOnce(null);
+      const response = await fetch(`${baseUrl}/object-1/download-url`, { headers: { authorization: 'Bearer tenant-user-1' } });
+      expect(response.status, reason).toBe(404);
+    }
+    expect(mocks.signedDownloadUrlAuthorized).not.toHaveBeenCalled();
+  });
+
+  it('never deletes another tenant\'s document or writes a tombstone for it', async () => {
+    mocks.objectMetadata.findFirst.mockResolvedValueOnce(null);
+    const response = await fetch(`${baseUrl}/object-1`, { method: 'DELETE', headers: { authorization: 'Bearer tenant-user-2' } });
+
+    expect(response.status).toBe(404);
+    expect(mocks.deleteAuthorized).not.toHaveBeenCalled();
+    expect(mocks.objectMetadata.updateMany).not.toHaveBeenCalled();
+    expect(mocks.auditLog.create).not.toHaveBeenCalled();
+  });
+
+  it('scopes the delete lookup to the authenticated owner', async () => {
+    mocks.objectMetadata.findFirst.mockResolvedValueOnce({ id: 'object-1', userId: 'user-1', bucket: 'private', objectKey: 'private/screenshot/user-1/' + 'a'.repeat(64), versionId: null, fileName: 'confirmation.png', mimeType: 'image/png', checksumSha256: 'a'.repeat(64), byteSize: BigInt(9), encryptionKeyRef: 'S3_MANAGED', scanStatus: 'CLEAN' });
+    await fetch(`${baseUrl}/object-1`, { method: 'DELETE', headers: { authorization: 'Bearer tenant-user-1' } });
+
+    expect(mocks.objectMetadata.findFirst).toHaveBeenCalledWith(expect.objectContaining({
+      where: { id: 'object-1', userId: 'user-1', deletedAt: null },
+    }));
+  });
+
+  it('attributes approval to the authenticated caller, not to client input', async () => {
+    mocks.approvePublic.mockResolvedValue({ id: 'object-1', approvalStatus: 'APPROVED', approvedAt: new Date('2026-09-15T00:00:00.000Z'), approvedBy: 'user-1' });
+    const response = await fetch(`${baseUrl}/object-1/approve`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer tenant-user-1', 'content-type': 'application/json' },
+      body: JSON.stringify({ approvedBy: 'user-2', approvalStatus: 'APPROVED' }),
+    });
+
+    expect(response.status).toBe(200);
+    expect(mocks.approvePublic).toHaveBeenCalledWith('user-1', 'object-1');
+  });
+
+  it('rejects an artifact bound to another tenant\'s application before any storage write', async () => {
+    mocks.tx.application.findFirst.mockResolvedValueOnce(null);
+    const response = await fetch(`${baseUrl}/upload`, { method: 'POST', headers: { authorization: 'Bearer tenant-user-2' }, body: uploadForm() });
+
+    expect(response.status).toBe(400);
+    expect(mocks.storeArtifact).not.toHaveBeenCalled();
+    expect(mocks.persist).not.toHaveBeenCalled();
+    expect(mocks.attach).not.toHaveBeenCalled();
+  });
+
+  it('scopes the application lookup to the authenticated owner', async () => {
+    await fetch(`${baseUrl}/upload`, { method: 'POST', headers: { authorization: 'Bearer tenant-user-1' }, body: uploadForm() });
+
+    expect(mocks.tx.application.findFirst).toHaveBeenCalledWith(expect.objectContaining({
+      where: { id: 'application-1', userId: 'user-1' },
+    }));
   });
 });

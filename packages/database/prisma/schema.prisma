@@ -683,6 +683,7 @@ model EmailConnection {
   grantedAt     DateTime  @default(now())
   revokedAt     DateTime?
   lastSyncAt    DateTime?
+  syncClaimedAt DateTime?
   syncCursor    String?
   createdAt     DateTime  @default(now())
   updatedAt     DateTime  @updatedAt
@@ -1266,9 +1267,9 @@ model ObjectMetadata {
   encryptionKeyRef     String?
   scanStatus           String                @default("PENDING")
   scanDetails          Json?
-  approvalStatus       String                @default("UNAPPROVED")
-  approvedAt           DateTime?
-  approvedBy           String?
+  approvalStatus       String                @default("UNAPPROVED") @map("approval_status")
+  approvedAt           DateTime?             @map("approved_at")
+  approvedBy           String?               @map("approved_by")
   expiresAt            DateTime?
   deletedAt            DateTime?
   legalHold            Boolean               @default(false)

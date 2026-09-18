@@ -10,17 +10,19 @@ vi.mock('@jobagent/database', () => ({ withTenant: mocks.withTenant }));
 
 const owner = { userId: 'owner-1', email: 'owner@example.invalid' };
 let presented: string;
+let sessionExpiresAt: Date;
 beforeEach(() => {
   vi.resetAllMocks();
   vi.stubEnv('JWT_SECRET', 'refresh-tests-only-secret-32-characters');
   presented = generateRefreshToken(owner);
+  sessionExpiresAt = new Date('2026-09-20T00:00:00.000Z');
   mocks.committed = false;
   mocks.withTenant.mockImplementation(async (_owner: string, operation: (tx: typeof mocks.tx) => Promise<unknown>) => {
     const result = await operation(mocks.tx);
     mocks.committed = true;
     return result;
   });
-  mocks.tx.refreshTokenSession.findFirst.mockResolvedValue({ id: 'session-1', familyId: 'family-1', revokedAt: null, expiresAt: new Date(Date.now() + 60_000) });
+  mocks.tx.refreshTokenSession.findFirst.mockResolvedValue({ id: 'session-1', familyId: 'family-1', revokedAt: null, expiresAt: sessionExpiresAt });
 });
 afterEach(() => vi.unstubAllEnvs());
 
@@ -32,6 +34,7 @@ describe('refresh session transaction boundary', () => {
     expect(verifyRefreshToken(result.refreshToken)).toEqual(owner);
     expect(verifyToken(result.token)).toEqual(owner);
     expect(mocks.tx.refreshTokenSession.create).toHaveBeenCalledWith({ data: expect.objectContaining({ userId: owner.userId, familyId: 'family-1', tokenHash: refreshTokenHash(result.refreshToken) }) });
+    expect(mocks.tx.refreshTokenSession.create).toHaveBeenCalledWith({ data: expect.objectContaining({ expiresAt: sessionExpiresAt }) });
   });
 
   it('commits reuse revocation and its audit before rejecting the refresh', async () => {

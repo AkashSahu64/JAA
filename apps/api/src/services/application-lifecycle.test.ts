@@ -67,4 +67,20 @@ describe('application lifecycle input boundary', () => {
     expect(recordInterview).toEqual(expect.any(Function));
     expect(recordOffer).toEqual(expect.any(Function));
   });
+
+  it('replays an existing interview source event without re-running a later state transition', async () => {
+    const existing = { id: 'interview-1', userId: 'user-1', applicationId: 'application-1', type: 'TECHNICAL', company: 'Acme', role: 'Engineer', round: 1, interviewer: undefined, meetingUrl: undefined, date: undefined };
+    const executeRaw = vi.fn();
+    mocks.withTenant.mockImplementationOnce(async (_userId: string, callback: (tx: unknown) => unknown) => callback({ $executeRaw: executeRaw, interview: { findUnique: vi.fn().mockResolvedValue(existing) } }));
+    await expect(recordInterview({ userId: 'user-1', applicationId: 'application-1', sourceEventId: 'event-1', type: 'TECHNICAL', company: 'Acme', role: 'Engineer' })).resolves.toEqual(existing);
+    expect(mocks.transition).not.toHaveBeenCalled();
+  });
+
+  it('replays an existing offer source event without re-running a later state transition', async () => {
+    const existing = { id: 'offer-1', userId: 'user-1', applicationId: 'application-1', company: 'Acme', role: 'Engineer', salaryOffered: undefined, currency: undefined, benefits: undefined, startDate: undefined, expiresAt: undefined };
+    const executeRaw = vi.fn();
+    mocks.withTenant.mockImplementationOnce(async (_userId: string, callback: (tx: unknown) => unknown) => callback({ $executeRaw: executeRaw, offer: { findUnique: vi.fn().mockResolvedValue(existing) } }));
+    await expect(recordOffer({ userId: 'user-1', applicationId: 'application-1', sourceEventId: 'event-2', company: 'Acme', role: 'Engineer' })).resolves.toEqual(existing);
+    expect(mocks.transition).not.toHaveBeenCalled();
+  });
 });

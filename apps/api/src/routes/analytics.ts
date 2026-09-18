@@ -5,10 +5,33 @@ import { logRouteError } from '../observability/structured-log';
 
 const router = Router();
 router.use(authenticate);
+// Analytics contain tenant-owned application performance data and must never be
+// retained by browser or intermediary caches.
+router.use((_req, res, next) => {
+  res.setHeader('Cache-Control', 'no-store');
+  next();
+});
 
 const RESPONSE_STATUSES = ['REJECTED', 'INTERVIEW', 'OFFER', 'ACCEPTED', 'WITHDRAWN'] as const;
 const INTERVIEW_STATUSES = ['INTERVIEW', 'OFFER', 'ACCEPTED'] as const;
 const OFFER_STATUSES = ['OFFER', 'ACCEPTED'] as const;
+const ANALYTICS_PAGE_SIZE = 1_000;
+
+/** Iterate large tenant datasets without materializing the entire history. */
+async function forEachAnalyticsPage<T extends { id: string }>(
+  fetchPage: (cursor?: string) => Promise<readonly T[]>,
+  consume: (row: T) => void,
+): Promise<void> {
+  let cursor: string | undefined;
+  for (;;) {
+    const page = await fetchPage(cursor);
+    for (const row of page) consume(row);
+    if (page.length < ANALYTICS_PAGE_SIZE) return;
+    const next = page[page.length - 1]?.id;
+    if (!next || next === cursor) throw new Error('Analytics pagination cursor did not advance');
+    cursor = next;
+  }
+}
 
 export function analyticsStatusPolicy() {
   return { responseStatuses: [...RESPONSE_STATUSES], interviewStatuses: [...INTERVIEW_STATUSES], offerStatuses: [...OFFER_STATUSES] };
@@ -73,6 +96,12 @@ export function summarizeOfferOutcomes(rows: Array<{ status: string }>) {
   return { total: Object.values(byStatus).reduce((sum, count) => sum + count, 0), byStatus };
 }
 
+export function applicationTimelineRows(grouped: Record<string, number>) {
+  return Object.entries(grouped)
+    .map(([date, count]) => ({ date, count }))
+    .sort((left, right) => left.date.localeCompare(right.date));
+}
+
 // GET /api/analytics/dashboard
 router.get('/dashboard', async (req: AuthenticatedRequest, res: Response) => {
   try {
@@ -85,7 +114,7 @@ router.get('/dashboard', async (req: AuthenticatedRequest, res: Response) => {
     const monthStart = new Date(todayStart);
     monthStart.setDate(monthStart.getDate() - 30);
 
-    const [jobsDiscovered, qualifiedJobs, applicationsToday, applicationsWeek, applicationsMonth, totalApplications, interviews, responses, failed, pending, offers, rejected, confirmed, interviewRows, offerRows] = await Promise.all([
+    const [jobsDiscovered, qualifiedJobs, applicationsToday, applicationsWeek, applicationsMonth, totalApplications, interviews, responses, failed, pending, offers, rejected, confirmed] = await Promise.all([
       prisma.jobDiscoveryItem.count({ where: { userId } }),
       prisma.jobMatch.count({ where: { userId, overall: { gte: 80 } } }),
       prisma.application.count({ where: { userId, appliedAt: { gte: todayStart } } }),
@@ -99,9 +128,28 @@ router.get('/dashboard', async (req: AuthenticatedRequest, res: Response) => {
       prisma.application.count({ where: { userId, status: { in: [...OFFER_STATUSES] } } }),
       prisma.application.count({ where: { userId, status: 'REJECTED' } }),
       prisma.application.count({ where: { userId, status: 'CONFIRMED' } }),
-      prisma.interview.findMany({ where: { userId }, select: { round: true } }),
-      prisma.offer.findMany({ where: { userId }, select: { status: true } }),
     ]);
+
+    const interviewSummary = { total: 0, highestRound: 0, byRound: {} as Record<string, number> };
+    await forEachAnalyticsPage(
+      cursor => prisma.interview.findMany({ where: { userId }, select: { id: true, round: true }, orderBy: { id: 'asc' }, take: ANALYTICS_PAGE_SIZE, ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}) }),
+      interview => {
+        if (!Number.isSafeInteger(interview.round) || interview.round < 1 || interview.round > 100) return;
+        interviewSummary.total += 1;
+        interviewSummary.highestRound = Math.max(interviewSummary.highestRound, interview.round);
+        const key = String(interview.round);
+        interviewSummary.byRound[key] = (interviewSummary.byRound[key] ?? 0) + 1;
+      },
+    );
+    const offerSummary = { total: 0, byStatus: {} as Record<string, number> };
+    await forEachAnalyticsPage(
+      cursor => prisma.offer.findMany({ where: { userId }, select: { id: true, status: true }, orderBy: { id: 'asc' }, take: ANALYTICS_PAGE_SIZE, ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}) }),
+      offer => {
+        if (!/^[A-Z_]{1,40}$/.test(offer.status)) return;
+        offerSummary.total += 1;
+        offerSummary.byStatus[offer.status] = (offerSummary.byStatus[offer.status] ?? 0) + 1;
+      },
+    );
 
     const matchScores = await prisma.jobMatch.aggregate({
       where: { userId },
@@ -118,14 +166,17 @@ router.get('/dashboard', async (req: AuthenticatedRequest, res: Response) => {
       where: { userId },
       _count: { _all: true },
     });
-    const providerApplications = await prisma.application.findMany({
-      where: { userId },
-      select: { status: true, job: { select: { source: true, title: true } } },
-    });
     const providerMetrics: Record<string, { total: number; confirmed: number; failed: number; confirmedRate: number }> = {};
     const roleMetrics: Record<string, { total: number; confirmed: number; failed: number; confirmedRate: number }> = {};
-    for (const application of providerApplications) {
-      const source = application.job.source;
+    await forEachAnalyticsPage(
+      cursor => prisma.application.findMany({
+        where: { userId },
+        select: { id: true, status: true, job: { select: { source: true, title: true } } },
+        orderBy: { id: 'asc' }, take: ANALYTICS_PAGE_SIZE,
+        ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
+      }),
+      application => {
+      const source = application.job.source.trim().toUpperCase();
       const role = application.job.title.trim() || 'UNSPECIFIED';
       const metrics = [providerMetrics[source] ??= { total: 0, confirmed: 0, failed: 0, confirmedRate: 0 }, roleMetrics[role] ??= { total: 0, confirmed: 0, failed: 0, confirmedRate: 0 }];
       for (const metric of metrics) {
@@ -134,37 +185,58 @@ router.get('/dashboard', async (req: AuthenticatedRequest, res: Response) => {
         if (application.status === 'FAILED') metric.failed += 1;
         metric.confirmedRate = metric.total > 0 ? metric.confirmed / metric.total * 100 : 0;
       }
-    }
-    const [failureRows, versionApplications, submissionAttempts] = await Promise.all([
-      prisma.failureRecord.groupBy({ by: ['code'], where: { userId }, _count: { _all: true } }),
-      prisma.application.findMany({ where: { userId }, select: { resumeVersionId: true, status: true } }),
-      prisma.applicationAttempt.findMany({
+      },
+    );
+    const failureRows = await prisma.failureRecord.groupBy({ by: ['code'], where: { userId }, _count: { _all: true } });
+    let submissionDurationCount = 0;
+    let submissionDurationTotalMs = 0;
+    await forEachAnalyticsPage(
+      cursor => prisma.applicationAttempt.findMany({
         where: { application: { userId }, status: { in: ['UNCONFIRMED', 'CONFIRMED'] }, completedAt: { not: null } },
-        select: { startedAt: true, completedAt: true },
+        select: { id: true, startedAt: true, completedAt: true }, orderBy: { id: 'asc' }, take: ANALYTICS_PAGE_SIZE,
+        ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
       }),
-    ]);
+      attempt => {
+        if (!(attempt.startedAt instanceof Date) || !Number.isFinite(attempt.startedAt.getTime())
+          || !(attempt.completedAt instanceof Date) || !Number.isFinite(attempt.completedAt.getTime())
+          || attempt.completedAt.getTime() < attempt.startedAt.getTime()) return;
+        submissionDurationCount += 1;
+        submissionDurationTotalMs += attempt.completedAt.getTime() - attempt.startedAt.getTime();
+      },
+    );
     const failureReasons = Object.fromEntries(failureRows.map(row => [row.code, row._count._all]));
     const resumeVersionPerformance: Record<string, { applications: number; confirmed: number; failed: number }> = {};
-    for (const application of versionApplications) {
-      const metric = resumeVersionPerformance[application.resumeVersionId] ??= { applications: 0, confirmed: 0, failed: 0 };
-      metric.applications += 1;
-      if (application.status === 'CONFIRMED') metric.confirmed += 1;
-      if (application.status === 'FAILED') metric.failed += 1;
-    }
-    const applicationFacts = await prisma.application.findMany({
-      where: { userId },
-      select: { atsScore: true, createdAt: true, appliedAt: true, confirmedAt: true },
-    });
+    await forEachAnalyticsPage(
+      cursor => prisma.application.findMany({
+        where: { userId },
+        select: { id: true, resumeVersionId: true, status: true },
+        orderBy: { id: 'asc' }, take: ANALYTICS_PAGE_SIZE,
+        ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
+      }),
+      application => {
+        const metric = resumeVersionPerformance[application.resumeVersionId] ??= { applications: 0, confirmed: 0, failed: 0 };
+        metric.applications += 1;
+        if (application.status === 'CONFIRMED') metric.confirmed += 1;
+        if (application.status === 'FAILED') metric.failed += 1;
+      },
+    );
     const atsScoreDistribution = { below60: 0, from60To79: 0, from80To89: 0, from90To100: 0 };
     const confirmationDurations: number[] = [];
-    const submissionDurations: Array<{ startedAt: Date | null; endedAt: Date | null }> = submissionAttempts.map(attempt => ({ startedAt: attempt.startedAt, endedAt: attempt.completedAt }));
-    for (const application of applicationFacts) {
+    await forEachAnalyticsPage(
+      cursor => prisma.application.findMany({
+        where: { userId },
+        select: { id: true, atsScore: true, createdAt: true, appliedAt: true, confirmedAt: true },
+        orderBy: { id: 'asc' }, take: ANALYTICS_PAGE_SIZE,
+        ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
+      }),
+      application => {
       const atsBucket = classifyAtsScore(application.atsScore);
       if (atsBucket) atsScoreDistribution[atsBucket] += 1;
       if (application.appliedAt && application.confirmedAt && application.confirmedAt >= application.appliedAt) {
         confirmationDurations.push(application.confirmedAt.getTime() - application.appliedAt.getTime());
       }
-    }
+      },
+    );
 
     return res.json({
       success: true,
@@ -192,9 +264,9 @@ router.get('/dashboard', async (req: AuthenticatedRequest, res: Response) => {
         averageTimeToConfirmationHours: confirmationDurations.length
           ? confirmationDurations.reduce((total, duration) => total + duration, 0) / confirmationDurations.length / 3_600_000
           : 0,
-        averageTimeToSubmissionHours: averageElapsedHours(submissionDurations),
-        interviewRounds: summarizeInterviewRounds(interviewRows),
-        offerOutcomes: summarizeOfferOutcomes(offerRows),
+        averageTimeToSubmissionHours: submissionDurationCount ? submissionDurationTotalMs / submissionDurationCount / 3_600_000 : 0,
+        interviewRounds: interviewSummary,
+        offerOutcomes: offerSummary,
       },
     });
     });
@@ -215,23 +287,21 @@ router.get('/applications-over-time', async (req: AuthenticatedRequest, res: Res
     startDate.setDate(startDate.getDate() - parsedDays);
 
     return withTenant(req.user!.userId, async prisma => {
-    const applications = await prisma.application.findMany({
-      where: {
-        userId: req.user!.userId,
-        createdAt: { gte: startDate },
-      },
-      select: { createdAt: true, status: true },
-      orderBy: { createdAt: 'asc' },
-    });
-
-    // Group by date
     const grouped: Record<string, number> = {};
-    for (const app of applications) {
-      const date = app.createdAt.toISOString().split('T')[0];
-      grouped[date] = (grouped[date] || 0) + 1;
-    }
+    await forEachAnalyticsPage(
+      cursor => prisma.application.findMany({
+        where: { userId: req.user!.userId, createdAt: { gte: startDate } },
+        select: { id: true, createdAt: true, status: true },
+        orderBy: { id: 'asc' }, take: ANALYTICS_PAGE_SIZE,
+        ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
+      }),
+      app => {
+        const date = app.createdAt.toISOString().split('T')[0]!;
+        grouped[date] = (grouped[date] || 0) + 1;
+      },
+    );
 
-    const data = Object.entries(grouped).map(([date, count]) => ({ date, count }));
+    const data = applicationTimelineRows(grouped);
 
     return res.json({ success: true, data });
     });
@@ -249,12 +319,23 @@ router.get('/applications-funnel', async (req: AuthenticatedRequest, res: Respon
     const startDate = new Date();
     startDate.setDate(startDate.getDate() - parsedDays);
     return withTenant(req.user!.userId, async prisma => {
-    const applications = await prisma.application.findMany({
-      where: { userId: req.user!.userId, createdAt: { gte: startDate } },
-      select: { createdAt: true, status: true },
-      orderBy: { createdAt: 'asc' },
-    });
-    return res.json({ success: true, data: groupApplicationsByDateAndStatus(applications) });
+    const grouped = new Map<string, { date: string; total: number; statuses: Record<string, number> }>();
+    await forEachAnalyticsPage(
+      cursor => prisma.application.findMany({
+        where: { userId: req.user!.userId, createdAt: { gte: startDate } },
+        select: { id: true, createdAt: true, status: true },
+        orderBy: { id: 'asc' }, take: ANALYTICS_PAGE_SIZE,
+        ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
+      }),
+      application => {
+        const date = application.createdAt.toISOString().slice(0, 10);
+        const row = grouped.get(date) ?? { date, total: 0, statuses: {} };
+        row.total += 1;
+        row.statuses[application.status] = (row.statuses[application.status] ?? 0) + 1;
+        grouped.set(date, row);
+      },
+    );
+    return res.json({ success: true, data: [...grouped.values()].sort((left, right) => left.date.localeCompare(right.date)) });
     });
   } catch (error) {
     logRouteError('analytics.funnel_failure', error, { correlationId: req.get('x-correlation-id'), userId: req.user?.userId });

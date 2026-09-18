@@ -4,6 +4,8 @@ import { consumeNotificationOutboxEvent, mapOutboxEventToNotification } from './
 import { publishOutboxBatch } from './outbox-publisher';
 import { publishSseEvent } from './sse-redis-bridge';
 
+const MAX_NOTIFICATION_SHUTDOWN_TIMEOUT_MS = 120_000;
+
 export interface NotificationOutboxRuntimeOptions {
   intervalMs?: number;
   batchSize?: number;
@@ -23,7 +25,7 @@ export function startNotificationOutboxRuntime(options: NotificationOutboxRuntim
   const shutdownTimeoutMs = options.shutdownTimeoutMs ?? 30_000;
   if (!Number.isSafeInteger(intervalMs) || intervalMs < 250) throw new Error('Notification outbox interval must be at least 250ms');
   if (!Number.isSafeInteger(batchSize) || batchSize < 1 || batchSize > 500) throw new Error('Notification outbox batch size must be between 1 and 500');
-  if (!Number.isSafeInteger(shutdownTimeoutMs) || shutdownTimeoutMs < 1_000) throw new Error('Notification outbox shutdown timeout must be at least one second');
+  if (!Number.isSafeInteger(shutdownTimeoutMs) || shutdownTimeoutMs < 1_000 || shutdownTimeoutMs > MAX_NOTIFICATION_SHUTDOWN_TIMEOUT_MS) throw new Error('Notification outbox shutdown timeout must be between one second and two minutes');
   const workerId = options.workerId?.trim() || `notifications-${randomUUID()}`;
   let running = false;
   let closed = false;
@@ -35,7 +37,7 @@ export function startNotificationOutboxRuntime(options: NotificationOutboxRuntim
       await publishOutboxBatch(async event => {
         const result = await consumeNotificationOutboxEvent(event);
         const notification = mapOutboxEventToNotification(event);
-        if (result.responseBody && typeof result.responseBody === 'object' && !Array.isArray(result.responseBody)
+        if (!result.replayed && result.responseBody && typeof result.responseBody === 'object' && !Array.isArray(result.responseBody)
           && (result.responseBody as Record<string, unknown>).consumed === true && notification && event.userId) {
           broadcastToUser(event.userId, { id: notification.id, type: 'notification', data: notification });
           if (process.env.NODE_ENV !== 'test') {

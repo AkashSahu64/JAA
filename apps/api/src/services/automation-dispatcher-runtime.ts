@@ -4,6 +4,8 @@ import { reconcileExpiredAutomationJobLeases } from './automation-jobs';
 import { reconcileStaleSubmissionAuthorizations } from './submission-engine';
 import { writeStructuredLog } from '../observability/structured-log';
 
+const MAX_RUNTIME_SHUTDOWN_TIMEOUT_MS = 120_000;
+
 export interface AutomationDispatcherRuntimeOptions {
   intervalMs?: number;
   batchSize?: number;
@@ -28,7 +30,7 @@ export class AutomationDispatcherRuntime {
     this.shutdownTimeoutMs = options.shutdownTimeoutMs ?? 30_000;
     if (!Number.isSafeInteger(this.intervalMs) || this.intervalMs <= 0) throw new Error('intervalMs must be a positive integer');
     if (!Number.isSafeInteger(this.batchSize) || this.batchSize <= 0) throw new Error('batchSize must be a positive integer');
-    if (!Number.isSafeInteger(this.shutdownTimeoutMs) || this.shutdownTimeoutMs < 1_000) throw new Error('Dispatcher shutdown timeout must be at least one second');
+    if (!Number.isSafeInteger(this.shutdownTimeoutMs) || this.shutdownTimeoutMs < 1_000 || this.shutdownTimeoutMs > MAX_RUNTIME_SHUTDOWN_TIMEOUT_MS) throw new Error('Dispatcher shutdown timeout must be between one second and two minutes');
     this.onError = options.onError ?? ((error) => writeStructuredLog('error', { event: 'automation.dispatch_failure', error: error instanceof Error ? error.message : 'unknown error' }));
     this.registry = new AutomationQueueRegistry({ url: options.url, prefix: options.prefix });
   }

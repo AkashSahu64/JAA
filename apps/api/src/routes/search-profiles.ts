@@ -33,6 +33,7 @@ export function validateProfile(body: unknown, partial: boolean): string | null 
   }))) return 'discoveryAccounts must contain valid provider/account objects';
   const schedules = new Set(['ONCE', 'HOURLY', 'EVERY_3_HOURS', 'DAILY', 'WEEKLY', 'CUSTOM']);
   if ('schedule' in body && (typeof body.schedule !== 'string' || !schedules.has(body.schedule))) return 'schedule is invalid';
+  if ('isActive' in body && typeof body.isActive !== 'boolean') return 'isActive must be a boolean';
   if ('customCron' in body && body.customCron !== null && (typeof body.customCron !== 'string' || body.customCron.length > 100)) return 'customCron is invalid';
   const schedule = typeof body.schedule === 'string' ? body.schedule : undefined;
   const customCron = typeof body.customCron === 'string' ? body.customCron.trim() : undefined;
@@ -47,7 +48,8 @@ export function validateProfile(body: unknown, partial: boolean): string | null 
     catch (error) { if (error instanceof SchedulerError) return 'customCron is invalid'; throw error; }
   }
   for (const field of ['minMatchScore', 'minATSScore']) if (field in body && (!Number.isInteger(body[field]) || body[field] < 0 || body[field] > 100)) return `${field} must be an integer from 0 to 100`;
-  for (const field of ['experienceMin', 'experienceMax', 'maxApplicationsPerDay']) if (field in body && body[field] !== null && (!Number.isInteger(body[field]) || body[field] < 0)) return `${field} must be a non-negative integer`;
+  for (const field of ['experienceMin', 'experienceMax']) if (field in body && body[field] !== null && (!Number.isInteger(body[field]) || body[field] < 0)) return `${field} must be a non-negative integer`;
+  if ('maxApplicationsPerDay' in body && (!Number.isInteger(body.maxApplicationsPerDay) || body.maxApplicationsPerDay < 1 || body.maxApplicationsPerDay > 10_000)) return 'maxApplicationsPerDay must be an integer from 1 to 10000';
   for (const field of ['salaryMin', 'salaryMax']) if (field in body && body[field] !== null && (typeof body[field] !== 'number' || !Number.isFinite(body[field]) || body[field] < 0)) return `${field} must be a non-negative number`;
   return null;
 }
